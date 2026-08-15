@@ -1,0 +1,30 @@
+{
+  "sources": [],
+  "inputDefinitions": [
+    {
+      "name": "machine",
+      "displayName": "Machine",
+      "category": "index",
+      "dataType": "string",
+      "status": "active",
+      "system": true
+    },
+    {
+      "name": "action",
+      "displayName": "Action",
+      "category": "index",
+      "dataType": "string",
+      "status": "active",
+      "system": true
+    },
+    {
+      "name": "material",
+      "displayName": "Material",
+      "category": "index",
+      "dataType": "string",
+      "status": "active",
+      "system": true
+    }
+  ],
+  "models": []
+}

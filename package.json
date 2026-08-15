@@ -1,0 +1,29 @@
+{
+  "name": "r2r-manufacturing-control",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "format": "prettier --write \"frontend/src/**/*.{ts,tsx,css}\" \"frontend/index.html\"",
+    "format:check": "prettier --check \"frontend/src/**/*.{ts,tsx,css}\" \"frontend/index.html\"",
+    "preview": "vite preview",
+    "test": "go test ./...",
+    "start": "go run ./cmd/server"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^3.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/dagre": "^0.7.54",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "prettier": "^3.9.6",
+    "typescript": "^5.7.2",
+    "vite": "^4.5.14"
+  }
+}
