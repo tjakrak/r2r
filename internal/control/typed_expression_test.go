@@ -1,6 +1,9 @@
 package control
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func expressionTestModel() Model {
 	return Model{
@@ -14,7 +17,7 @@ func expressionTestModel() Model {
 func TestTypedExpressionSupportsConditionsReferencesAndLookups(t *testing.T) {
 	model := expressionTestModel()
 	rows := map[string][]map[string]interface{}{"rules": {{"threshold": float64(2), "recipe": "A"}}}
-	value, err := EvaluateTypedExpression(`IF(@rework, LOOKUP_ONE(@rules, threshold == @base, recipe), "standard")`, "string", model,
+	value, err := EvaluateTypedExpression(`IF(@rework, LOOKUP_ONE(@rules, @rules.threshold == @base, @rules.recipe), "standard")`, "string", model,
 		map[string]interface{}{"rework": true}, map[string]interface{}{"base": float64(2)}, rows)
 	if err != nil {
 		t.Fatal(err)
@@ -107,19 +110,23 @@ func TestExpressionDependencyEdgesIncludeDetails(t *testing.T) {
 	}
 }
 
-func TestDataSampleContainsReturnsBoolean(t *testing.T) {
+func TestDataSampleContainsUsesExactCaseInsensitiveMembership(t *testing.T) {
 	model := expressionTestModel()
 	model.ExternalInputs = append(model.ExternalInputs, ExternalInputDefinition{Name: "search", Type: "string"})
 	rows := map[string][]map[string]interface{}{"rules": {
 		{"threshold": float64(1), "recipe": "RECIPE_A"},
 		{"threshold": float64(2), "recipe": "RECIPE_B"},
 	}}
-	value, err := EvaluateTypedExpression(`CONTAINS(@rules.recipe, @search)`, "boolean", model, map[string]interface{}{"search": "cipe_b"}, nil, rows)
+	value, err := EvaluateTypedExpression(`CONTAINS(@rules.recipe, @search)`, "boolean", model, map[string]interface{}{"search": "recipe_b"}, nil, rows)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if value != true {
-		t.Fatalf("expected case-insensitive match, got %#v", value)
+		t.Fatalf("expected exact case-insensitive match, got %#v", value)
+	}
+	value, err = EvaluateTypedExpression(`CONTAINS(@rules.recipe, @search)`, "boolean", model, map[string]interface{}{"search": "cipe_b"}, nil, rows)
+	if err != nil || value != false {
+		t.Fatalf("partial text must not satisfy CONTAINS, got %#v, %v", value, err)
 	}
 	refs := map[string]string{"search": "string"}
 	if err := ValidateTypedExpression(`CONTAINS(@rules.recipe, @search)`, "boolean", model, refs); err != nil {
@@ -128,5 +135,102 @@ func TestDataSampleContainsReturnsBoolean(t *testing.T) {
 	dependencies, samples, err := TypedExpressionDependencies(`CONTAINS(@rules.recipe, @search)`)
 	if err != nil || len(dependencies) != 1 || dependencies[0] != "search" || len(samples) != 1 || samples[0] != "rules" {
 		t.Fatalf("unexpected dependencies: %#v %#v %v", dependencies, samples, err)
+	}
+}
+
+func TestDataSampleMatchesUsesRegularExpression(t *testing.T) {
+	model := expressionTestModel()
+	rows := map[string][]map[string]interface{}{"rules": {
+		{"threshold": float64(1), "recipe": "RECIPE_A"},
+		{"threshold": float64(2), "recipe": "RECIPE_B"},
+	}}
+	value, err := EvaluateTypedExpression(`MATCHES(@rules.recipe, "^RECIPE_[AB]$")`, "boolean", model, nil, nil, rows)
+	if err != nil || value != true {
+		t.Fatalf("expected regex match, got %#v, %v", value, err)
+	}
+	if _, err := EvaluateTypedExpression(`MATCHES(@rules.recipe, "[")`, "boolean", model, nil, nil, rows); err == nil || !strings.Contains(err.Error(), "pattern is invalid") {
+		t.Fatalf("expected invalid regex error, got %v", err)
+	}
+}
+
+func TestNullableLookupCanBeHandledWithIsNull(t *testing.T) {
+	model := Model{
+		ID: "nullable", FamilyID: "nullable", Name: "Nullable lookup",
+		Indexes: map[string]IndexValues{"machine": {"M1"}, "action": {"run"}, "material": {"Si"}},
+		Parameters: []ParameterDefinition{
+			{Key: "optional_recipe", DataType: "string", Source: "expression", Definition: `LOOKUP_FIRST(@rules, @rules.operation == "MISSING", @rules.recipe)`},
+			{Key: "recipe", DataType: "string", Source: "expression", Definition: `IF(IS_NULL(@optional_recipe), "DEFAULT", @optional_recipe)`},
+		},
+		DataSamples: []DataSampleDefinition{{
+			Key: "rules", Source: "static", Limit: 10,
+			Columns: []DataSampleColumnDefinition{{Name: "operation", Type: "string"}, {Name: "recipe", Type: "string"}},
+			Rows:    []map[string]interface{}{{"operation": "OTHER", "recipe": "R1"}},
+		}},
+		Outputs: []string{"optional_recipe", "recipe"},
+	}
+	if err := ValidateModel(model); err != nil {
+		t.Fatal(err)
+	}
+	values, _, unresolved, err := ResolveModel(model, map[string]interface{}{}, nil, nil, nil, nil, nil)
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("resolve nullable lookup: %v, unresolved=%v", err, unresolved)
+	}
+	if value, exists := values["optional_recipe"]; !exists || value != nil {
+		t.Fatalf("nullable parameter must be resolved as null, got %#v", values)
+	}
+	if values["recipe"] != "DEFAULT" {
+		t.Fatalf("IS_NULL fallback was not selected: %#v", values)
+	}
+	outputs, err := EvaluateResolvedOutputs(model, values, nil)
+	if err != nil || outputs[0].Value != nil {
+		t.Fatalf("nullable output was not preserved: %#v, %v", outputs, err)
+	}
+}
+
+func TestDataSampleNullCells(t *testing.T) {
+	model := expressionTestModel()
+	rows := map[string][]map[string]interface{}{"rules": {
+		{"threshold": nil, "recipe": nil},
+		{"threshold": float64(2), "recipe": "RECIPE_B"},
+	}}
+
+	value, err := EvaluateTypedExpression(`IS_NULL(FIRST(@rules.recipe))`, "boolean", model, nil, nil, rows)
+	if err != nil || value != true {
+		t.Fatalf("expected FIRST to preserve NULL, got %#v, %v", value, err)
+	}
+	value, err = EvaluateTypedExpression(`CONTAINS(@rules.recipe, "RECIPE_B")`, "boolean", model, nil, nil, rows)
+	if err != nil || value != true {
+		t.Fatalf("expected membership to skip NULL, got %#v, %v", value, err)
+	}
+	value, err = EvaluateTypedExpression(`LOOKUP_FIRST(@rules, @rules.threshold > 1, @rules.recipe)`, "string", model, nil, nil, rows)
+	if err != nil || value != "RECIPE_B" {
+		t.Fatalf("expected lookup comparison to skip NULL, got %#v, %v", value, err)
+	}
+
+	count, err := EvaluateWithSamples(`COUNT(@rules.threshold)`, nil, rows)
+	if err != nil || count != float64(1) {
+		t.Fatalf("expected COUNT to ignore NULL, got %#v, %v", count, err)
+	}
+	average, err := EvaluateWithSamples(`AVG(@rules.threshold)`, nil, rows)
+	if err != nil || average != float64(2) {
+		t.Fatalf("expected AVG to ignore NULL, got %#v, %v", average, err)
+	}
+}
+
+func TestDeclaredDataSampleSchemasAcceptNullCells(t *testing.T) {
+	sample := DataSampleDefinition{
+		Key: "nullable_sample", Source: "static", Limit: 10,
+		Columns: []DataSampleColumnDefinition{
+			{Name: "number_value", Type: "number"},
+			{Name: "text_value", Type: "string"},
+			{Name: "boolean_value", Type: "boolean"},
+		},
+		Rows: []map[string]interface{}{{"number_value": nil, "text_value": nil, "boolean_value": nil}},
+	}
+	if err := validateStaticDataSample(sample); err != nil {
+		t.Fatalf("static NULL cells should validate: %v", err)
+	}
+	if _, err := validateResolvedDataSampleRows(sample, sample.Rows); err != nil {
+		t.Fatalf("resolved SQL NULL cells should validate: %v", err)
 	}
 }

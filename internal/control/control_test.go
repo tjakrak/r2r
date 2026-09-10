@@ -1,6 +1,7 @@
 package control
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -52,6 +53,33 @@ func TestSelectRejectsEquallySpecificOverlappingModels(t *testing.T) {
 	_, _, err := Select([]Model{first, second}, map[string]interface{}{"machine": "ETCH-02", "action": "OXIDE_ETCH", "material": "OXIDE", "chamber": "2"})
 	if err == nil || !strings.Contains(err.Error(), "ambiguous routing") {
 		t.Fatalf("expected ambiguity error, got %v", err)
+	}
+}
+func TestSelectIndexWildcardAcceptsAnyNonEmptyValueAndLosesToExactMatch(t *testing.T) {
+	wildcard := fixture()
+	wildcard.ID = "wildcard"
+	wildcard.Name = "All materials"
+	wildcard.Indexes["material"] = IndexValues{"*"}
+	exact := fixture()
+	exact.ID = "exact"
+	exact.Name = "Oxide only"
+	context := map[string]interface{}{"machine": "ETCH-02", "action": "OXIDE_ETCH", "material": "OXIDE", "chamber": "B"}
+	selected, _, err := Select([]Model{wildcard, exact}, context)
+	if err != nil || selected.ID != "exact" {
+		t.Fatalf("expected exact model to beat wildcard, got %s %v", selected.ID, err)
+	}
+	context["material"] = "NITRIDE"
+	selected, _, err = Select([]Model{wildcard, exact}, context)
+	if err != nil || selected.ID != "wildcard" {
+		t.Fatalf("expected wildcard model for another non-empty value, got %s %v", selected.ID, err)
+	}
+}
+
+func TestValidateModelRejectsWildcardCombinedWithExactValues(t *testing.T) {
+	model := fixture()
+	model.Indexes["material"] = IndexValues{"*", "OXIDE"}
+	if err := ValidateModel(model); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected mixed wildcard values to fail validation, got %v", err)
 	}
 }
 func TestResolvesExternalConstantSQLAndFormula(t *testing.T) {
@@ -341,6 +369,37 @@ func TestEmptyDependencyGraphUsesEmptyCollections(t *testing.T) {
 		t.Fatalf("empty graph collections must not be nil: %+v", graph)
 	}
 }
+
+func TestDependencyGraphListsTypedDataSampleColumns(t *testing.T) {
+	model := Model{DataSamples: []DataSampleDefinition{
+		{
+			Key: "history", Source: "sql", DataSourceID: "metrology",
+			Columns: []DataSampleColumnDefinition{{Name: "measurement", Type: "number"}, {Name: "accepted", Type: "boolean"}},
+		},
+		{
+			Key: "rules", Source: "static",
+			Columns: []DataSampleColumnDefinition{{Name: "operation", Type: "string"}, {Name: "recipe", Type: "string"}},
+		},
+	}}
+	graph, err := BuildDependencyGraph(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	properties := map[string]map[string]interface{}{}
+	for _, node := range graph.Nodes {
+		properties[node.Key] = map[string]interface{}{}
+		for _, property := range node.Properties {
+			properties[node.Key][property.Label] = property.Value
+		}
+	}
+	if got := fmt.Sprint(properties["history"]["Expected columns"]); got != "[measurement (number) accepted (boolean)]" {
+		t.Fatalf("unexpected SQL expected columns: %s", got)
+	}
+	if got := fmt.Sprint(properties["rules"]["Columns"]); got != "[operation (text) recipe (text)]" {
+		t.Fatalf("unexpected static columns: %s", got)
+	}
+}
+
 func TestCorrectionDependencyEdgesAreAccurate(t *testing.T) {
 	graph, err := BuildDependencyGraph(fixture())
 	if err != nil {
@@ -854,7 +913,7 @@ func TestLookupFormulaSupportsMultipleColumns(t *testing.T) {
 	model := fixture()
 	model.Parameters = []ParameterDefinition{{
 		Key: "recipe", DataType: "string", Source: "formula",
-		Definition: `LOOKUP_ONE(@recipes, colA == "A" AND colB == @requested_b, colC)`,
+		Definition: `LOOKUP_ONE(@recipes, @recipes.colA == "A" AND @recipes.colB == @requested_b, @recipes.colC)`,
 	}}
 	model.ExternalInputs = append(model.ExternalInputs, ExternalInputDefinition{Name: "requested_b", Type: "string"})
 	model.DataSamples = []DataSampleDefinition{{
@@ -881,13 +940,14 @@ func TestLookupFormulaValidationUsesDeclaredTypes(t *testing.T) {
 	references := map[string]string{"lower": "number", "text_value": "string"}
 	indexes := map[string]IndexValues{"chamber": {"A", "B"}}
 	tests := []struct{ name, expression, resultType, errorText string }{
-		{"valid numerical range", `LOOKUP_ONE(@ranges, minimum > @lower AND minimum < 2, label)`, "string", ""},
-		{"text ordering", `LOOKUP_ONE(@ranges, label > "A", label)`, "string", "requires numerical operands"},
-		{"mixed equality", `LOOKUP_ONE(@ranges, minimum == "1", label)`, "string", "same type"},
-		{"boolean ordering", `LOOKUP_ONE(@ranges, enabled < true, label)`, "string", "requires numerical operands"},
-		{"wrong reference type", `LOOKUP_ONE(@ranges, minimum > @text_value, label)`, "string", "got number and text"},
-		{"unknown reference", `LOOKUP_ONE(@ranges, minimum > @missing, label)`, "string", "unknown reference @missing"},
-		{"wrong return type", `LOOKUP_ONE(@ranges, minimum > 0, label)`, "number", "parameter result is number"},
+		{"valid numerical range", `LOOKUP_ONE(@ranges, @ranges.minimum > @lower AND @ranges.minimum < 2, @ranges.label)`, "string", ""},
+		{"text ordering", `LOOKUP_ONE(@ranges, @ranges.label > "A", @ranges.label)`, "string", "requires numerical operands"},
+		{"mixed equality", `LOOKUP_ONE(@ranges, @ranges.minimum == "1", @ranges.label)`, "string", "same type"},
+		{"boolean ordering", `LOOKUP_ONE(@ranges, @ranges.enabled < true, @ranges.label)`, "string", "requires numerical operands"},
+		{"wrong reference type", `LOOKUP_ONE(@ranges, @ranges.minimum > @text_value, @ranges.label)`, "string", "got number and text"},
+		{"unknown reference", `LOOKUP_ONE(@ranges, @ranges.minimum > @missing, @ranges.label)`, "string", "unknown reference @missing"},
+		{"bare column", `LOOKUP_ONE(@ranges, minimum > 0, @ranges.label)`, "string", "must be referenced as @ranges.minimum"},
+		{"wrong return type", `LOOKUP_ONE(@ranges, @ranges.minimum > 0, @ranges.label)`, "number", "parameter result is number"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

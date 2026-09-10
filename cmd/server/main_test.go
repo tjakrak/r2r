@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
@@ -8,12 +9,21 @@ import (
 	"os"
 	"path/filepath"
 	"r2r/internal/control"
+	"r2r/internal/corporateauth"
 	"r2r/internal/store"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+type testAuthenticator struct {
+	result corporateauth.Result
+}
+
+func (a testAuthenticator) Authenticate(context.Context, string, string) (corporateauth.Result, error) {
+	return a.result, nil
+}
 
 func TestBindSQLParametersUsesPreviouslyResolvedValues(t *testing.T) {
 	arguments, err := bindSQLParameters(
@@ -64,8 +74,26 @@ func TestModelContractDescribesExternalInputsAndOutputs(t *testing.T) {
 		Outputs:        []string{"decision"},
 	}
 	contract := modelContract(model)
-	if len(contract["indexes"].([]map[string]interface{})) != 1 || len(contract["externalInputs"].([]map[string]interface{})) != 1 || len(contract["optionalParameterOverrides"].([]map[string]interface{})) != 1 || len(contract["outputs"].([]map[string]interface{})) != 1 {
+	if len(contract["indexes"].([]map[string]interface{})) != 1 || len(contract["externalInputs"].([]map[string]interface{})) != 1 || len(contract["outputs"].([]map[string]interface{})) != 1 {
 		t.Fatalf("incomplete contract: %#v", contract)
+	}
+	if _, exists := contract["optionalParameterOverrides"]; exists {
+		t.Fatalf("production contract must not advertise parameter overrides: %#v", contract)
+	}
+}
+
+func TestModelContractMarksOnlyCoreIndexesRequired(t *testing.T) {
+	model := control.Model{Indexes: map[string]control.IndexValues{
+		"machine": {"M1"},
+		"chamber": {"C1"},
+	}}
+	contract := modelContract(model)
+	required := map[string]bool{}
+	for _, index := range contract["indexes"].([]map[string]interface{}) {
+		required[index["name"].(string)] = index["required"].(bool)
+	}
+	if !required["machine"] || required["chamber"] {
+		t.Fatalf("unexpected index requirements: %#v", required)
 	}
 }
 
@@ -89,6 +117,65 @@ func TestPrepareRejectsCallerSuppliedDataSamples(t *testing.T) {
 	s.prepare(recorder, request)
 	if recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(recorder.Body.String(), "cannot be supplied") {
 		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPrepareRejectsCallerSuppliedRunID(t *testing.T) {
+	s := &server{}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(`{"runId":"external-id","context":{}}`))
+	recorder := httptest.NewRecorder()
+	s.prepare(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "unknown field") {
+		t.Fatalf("expected caller-supplied runId to be rejected, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPrepareRejectsCallerSuppliedParameterValues(t *testing.T) {
+	s := &server{}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(`{"parameterValues":{"latest_cd":42.5},"context":{}}`))
+	recorder := httptest.NewRecorder()
+	s.prepare(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "unknown field") {
+		t.Fatalf("expected parameterValues to be rejected, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPrepareRejectsLegacyCombinedContext(t *testing.T) {
+	s := &server{}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(`{"context":{"machine":"M1"}}`))
+	recorder := httptest.NewRecorder()
+	s.prepare(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "unknown field") {
+		t.Fatalf("expected legacy context to be rejected, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestReadOnlySQLAcceptsOneSelectAndRejectsAdditionalStatements(t *testing.T) {
+	query, err := readOnlySQL("  SELECT value FROM measurements; ")
+	if err != nil || query != "SELECT value FROM measurements" {
+		t.Fatalf("unexpected normalized query %q: %v", query, err)
+	}
+	for _, invalid := range []string{
+		"UPDATE measurements SET value = 1",
+		"SELECT value FROM measurements; DELETE FROM measurements",
+	} {
+		if _, err := readOnlySQL(invalid); err == nil {
+			t.Fatalf("expected query to be rejected: %s", invalid)
+		}
+	}
+}
+
+func TestNormalizeSQLTestValueUsesDeclaredType(t *testing.T) {
+	number, err := normalizeSQLTestValue(int64(12), "number")
+	if err != nil || number != float64(12) {
+		t.Fatalf("unexpected number result: %v %v", number, err)
+	}
+	boolean, err := normalizeSQLTestValue(true, "boolean")
+	if err != nil || boolean != true {
+		t.Fatalf("unexpected boolean result: %v %v", boolean, err)
+	}
+	if _, err := normalizeSQLTestValue(int64(12), "string"); err == nil {
+		t.Fatal("expected a non-text SQL value to fail text validation")
 	}
 }
 
@@ -132,6 +219,46 @@ func TestLoginRejectsAuthenticatedEmployeeWhoIsNotRegisteredInR2R(t *testing.T) 
 	s.login(recorder, request)
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("unregistered employee was allowed to sign in: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCorporateLoginAutoRegistersUnregisteredEmployeeAsViewer(t *testing.T) {
+	data, _ := json.Marshal(store.Config{})
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{
+		store: st,
+		authenticator: testAuthenticator{result: corporateauth.Result{
+			Authenticated: true,
+			EmployeeID:    "E301",
+		}},
+		employees: map[string]employeeRecord{
+			"E301": {IDNum: "E301", LoginID: "new.employee", FirstName: "New", LastName: "Employee", Email: "new.employee@example.test"},
+		},
+		sessions: map[string]user{},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"new.employee","password":"valid"}`))
+	recorder := httptest.NewRecorder()
+	s.login(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"role":"viewer"`) {
+		t.Fatalf("corporate login did not create a viewer: %d %s", recorder.Code, recorder.Body.String())
+	}
+	registrations := st.UserRegistrations()
+	if len(registrations) != 1 || registrations[0].EmployeeID != "E301" || registrations[0].Role != "viewer" || registrations[0].Status != "active" {
+		t.Fatalf("unexpected auto-registration: %+v", registrations)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/login", strings.NewReader(`{"username":"new.employee","password":"valid"}`))
+	recorder = httptest.NewRecorder()
+	s.login(recorder, request)
+	if recorder.Code != http.StatusOK || len(st.UserRegistrations()) != 1 {
+		t.Fatalf("repeat login duplicated or rejected registration: %d %+v", recorder.Code, st.UserRegistrations())
 	}
 }
 
@@ -189,6 +316,24 @@ func TestOnlySubmittersDirectSupervisorCanApprove(t *testing.T) {
 	s.revisions(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("direct supervisor could not approve: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestIndexedSimulationSampleHeadersCreateMultipleRows(t *testing.T) {
+	samples := map[string][]map[string]interface{}{}
+	if !addSimulationSampleValue(samples, "wafer_history[0].operation", "CLU170") ||
+		!addSimulationSampleValue(samples, "wafer_history[1].operation", "CLU160") ||
+		!addSimulationSampleValue(samples, "wafer_history[2].measurement", "0.030") {
+		t.Fatal("indexed data-sample headers were not recognized")
+	}
+	if len(samples["wafer_history"]) != 3 {
+		t.Fatalf("expected three sample rows, got %#v", samples["wafer_history"])
+	}
+	if samples["wafer_history"][1]["operation"] != "CLU160" || samples["wafer_history"][2]["measurement"] != "0.030" {
+		t.Fatalf("indexed values were assigned to the wrong rows: %#v", samples["wafer_history"])
+	}
+	if !addSimulationSampleValue(samples, "wafer_history[4].operation", "") || len(samples["wafer_history"]) != 3 {
+		t.Fatal("blank indexed values should not create empty sample rows")
 	}
 }
 
@@ -263,6 +408,45 @@ func TestClientIPSupportsIPv4AndIPv6(t *testing.T) {
 	}
 }
 
+func TestRecentRunTaskUsesAvailableExecutionIdentity(t *testing.T) {
+	tests := []struct {
+		name    string
+		context map[string]interface{}
+		want    string
+	}{
+		{"legacy lot", map[string]interface{}{"lotId": "LOT-1", "action": "CALCULATE"}, "LOT-1 · CALCULATE"},
+		{"wafer", map[string]interface{}{"wafer_id": "W01", "action": "RECIPE_SELECTION"}, "W01 · RECIPE_SELECTION"},
+		{"operation fallback", map[string]interface{}{"machine": "M1", "operation": "ARI170"}, "M1 · ARI170"},
+		{"missing context", map[string]interface{}{}, "Run"},
+		{"nil values", map[string]interface{}{"lotId": nil, "action": nil}, "Run"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := recentRunTask(test.context); got != test.want {
+				t.Fatalf("recentRunTask() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestListenPort(t *testing.T) {
+	t.Setenv("PORT", "")
+	t.Setenv("HTTP_PLATFORM_PORT", "")
+	if got := listenPort(); got != "4173" {
+		t.Fatalf("default listen port = %q, want 4173", got)
+	}
+
+	t.Setenv("HTTP_PLATFORM_PORT", "58123")
+	if got := listenPort(); got != "58123" {
+		t.Fatalf("HTTP platform listen port = %q, want 58123", got)
+	}
+
+	t.Setenv("PORT", "9000")
+	if got := listenPort(); got != "9000" {
+		t.Fatalf("explicit listen port = %q, want 9000", got)
+	}
+}
+
 func TestCompleteRequiresFeedbackAndKeepsRunPrepared(t *testing.T) {
 	s, runID := completionTestServer(t)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+runID+"/complete", strings.NewReader(`{"status":"succeeded"}`))
@@ -318,7 +502,7 @@ func TestPrepareRejectsOutOfLimitRunWithoutRecordingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{store: st}
-	body := `{"runId":"rejected-run","context":{"machine":"M1","action":"TEST","material":"OXIDE"}}`
+	body := `{"indexes":{"machine":"M1","action":"TEST","material":"OXIDE"}}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(body))
 	recorder := httptest.NewRecorder()
 	s.prepare(recorder, request)
@@ -327,7 +511,7 @@ func TestPrepareRejectsOutOfLimitRunWithoutRecordingIt(t *testing.T) {
 		!strings.Contains(recorder.Body.String(), `parameter \"result\" value 2 is below LSL 3`) {
 		t.Fatalf("expected structured run rejection, got %d %s", recorder.Code, recorder.Body.String())
 	}
-	if _, exists := st.Run("rejected-run"); exists {
+	if len(st.RecentRuns(10)) != 0 {
 		t.Fatal("rejected run was persisted")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"r2r/internal/control"
@@ -265,6 +266,60 @@ func TestDeleteDraftRevisionAndFamily(t *testing.T) {
 	}
 }
 
+func TestDeleteFamilyRejectsRetainedExecutionHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	model := control.Model{ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "approved"}
+	data, _ := json.Marshal(Config{
+		Models: []control.Model{model},
+		Runs:   []RunRecord{{RunID: "run-1", FamilyID: "etch", ModelID: model.ID}},
+	})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteFamily(model.ID); err == nil || !strings.Contains(err.Error(), "execution history") {
+		t.Fatalf("expected retained run history to block deletion, got %v", err)
+	}
+	if _, exists := s.Model(model.ID); !exists {
+		t.Fatal("blocked family deletion removed the model")
+	}
+}
+
+func TestRetireAndPurgeFamilyWithExecutionHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	model := control.Model{ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "approved", Enabled: true}
+	data, _ := json.Marshal(Config{
+		Models:         []control.Model{model},
+		Runs:           []RunRecord{{RunID: "run-1", FamilyID: "etch", ModelID: model.ID}},
+		AdaptiveStates: map[string]AdaptiveState{"etch|machine=M1": {Value: 1}},
+	})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := s.RetireFamily(model.ID)
+	if err != nil || retired.Enabled {
+		t.Fatalf("retire family failed: %+v %v", retired, err)
+	}
+	summary, err := s.ModelPurgeSummary(model.ID)
+	if err != nil || summary.RevisionCount != 1 || summary.RunCount != 1 || summary.ModelName != "Etch" {
+		t.Fatalf("unexpected purge summary: %+v %v", summary, err)
+	}
+	purged, err := s.PurgeFamily(model.ID)
+	if err != nil || purged.RevisionCount != 1 || purged.RunCount != 1 {
+		t.Fatalf("purge family failed: %+v %v", purged, err)
+	}
+	if _, exists := s.Model(model.ID); exists || len(s.Config().Runs) != 0 || len(s.Config().AdaptiveStates) != 0 {
+		t.Fatal("purge retained current model, run, or adaptive state")
+	}
+}
+
 func TestPreparedRunLimitUsesConfiguredPartition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0600); err != nil {
@@ -303,6 +358,33 @@ func TestPreparedRunLimitUsesConfiguredPartition(t *testing.T) {
 	}
 	if _, err := s.RecordPreparedRun(record("run-4", "1"), model, nil); err != nil {
 		t.Fatalf("completed run should release the partition: %v", err)
+	}
+}
+
+func TestPreparedRunsAreUnlimitedWhenLimitIsOmitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := control.Model{
+		FamilyID: "unlimited-model",
+		Indexes:  map[string]control.IndexValues{"machine": {"M1"}},
+		ExecutionPolicy: control.ExecutionPolicy{
+			PartitionBy: []string{"machine"},
+		},
+	}
+	for _, runID := range []string{"run-1", "run-2", "run-3"} {
+		_, err := s.RecordPreparedRun(RunRecord{
+			RunID: runID, FamilyID: model.FamilyID, Status: "prepared",
+			Context: map[string]interface{}{"machine": "M1"},
+		}, model, nil)
+		if err != nil {
+			t.Fatalf("omitted limit should allow %s: %v", runID, err)
+		}
 	}
 }
 

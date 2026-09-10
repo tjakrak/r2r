@@ -24,6 +24,30 @@
       "dataType": "string",
       "status": "active",
       "system": true
+    },
+    {
+      "name": "wafer_id",
+      "displayName": "Wafer ID",
+      "category": "external",
+      "dataType": "string",
+      "description": "Wafer identifier supplied by the external application.",
+      "status": "active"
+    },
+    {
+      "name": "operation",
+      "displayName": "Operation",
+      "category": "external",
+      "dataType": "string",
+      "description": "Current manufacturing operation.",
+      "status": "active"
+    },
+    {
+      "name": "product",
+      "displayName": "Product",
+      "category": "external",
+      "dataType": "string",
+      "description": "Product number supplied by the external application.",
+      "status": "active"
     }
   ],
   "models": []

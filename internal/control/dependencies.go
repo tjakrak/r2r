@@ -169,15 +169,24 @@ func BuildDependencyGraph(model Model) (DependencyGraph, error) {
 		}
 		if sample.Source == "static" {
 			properties = append(properties,
-				DependencyProperty{Label: "Columns", Value: len(sample.Columns)},
 				DependencyProperty{Label: "Rows", Value: len(sample.Rows)},
 			)
 		} else {
 			properties = append(properties,
 				DependencyProperty{Label: "Data source", Value: sample.DataSourceID},
 				DependencyProperty{Label: "Query", Value: sample.Query},
-				DependencyProperty{Label: "Declared columns", Value: len(sample.Columns)},
 			)
+		}
+		if len(sample.Columns) > 0 {
+			label := "Columns"
+			if sample.Source != "static" {
+				label = "Expected columns"
+			}
+			columns := make([]string, 0, len(sample.Columns))
+			for _, column := range sample.Columns {
+				columns = append(columns, fmt.Sprintf("%s (%s)", column.Name, typeLabel(column.Type)))
+			}
+			properties = append(properties, DependencyProperty{Label: label, Value: columns})
 		}
 		if sample.Description != "" {
 			properties = append(properties, DependencyProperty{Label: "Description", Value: sample.Description})

@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"r2r/internal/control"
+	"r2r/internal/corporateauth"
+	"r2r/internal/employeedirectory"
 	"r2r/internal/store"
 	"regexp"
 	"sort"
@@ -33,6 +35,8 @@ import (
 
 type server struct {
 	store              *store.Store
+	authenticator      corporateauth.Authenticator
+	employeeDirectory  employeedirectory.Repository
 	mu                 sync.RWMutex
 	users              map[string]user
 	employees          map[string]employeeRecord
@@ -42,24 +46,23 @@ type server struct {
 type user struct {
 	EmployeeID    string   `json:"employeeId"`
 	Username      string   `json:"username"`
+	DisplayName   string   `json:"displayName,omitempty"`
 	Email         string   `json:"email,omitempty"`
 	Role          string   `json:"role"`
 	Status        string   `json:"status,omitempty"`
 	DirectReports []string `json:"directReports,omitempty"`
 	Password      string   `json:"-"` // Legacy test compatibility; production authentication is external.
 }
-type employeeRecord struct {
-	IDNum        string `json:"IDNUM"`
-	LoginID      string `json:"LOGINID"`
-	Email        string `json:"EMAIL"`
-	SupervisorID string `json:"SUPID"`
-}
+type employeeRecord = employeedirectory.Record
 type credentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
 var operationalLogMu sync.Mutex
+var operationalDB *sql.DB
+
+const applicationBasePath = "/R2RProcessControl"
 
 func operationalLog(level, event string, fields map[string]interface{}) {
 	record := map[string]interface{}{
@@ -78,6 +81,39 @@ func operationalLog(level, event string, fields map[string]interface{}) {
 	operationalLogMu.Lock()
 	defer operationalLogMu.Unlock()
 	_, _ = os.Stdout.Write(append(encoded, '\n'))
+	if operationalDB != nil {
+		instanceID, _ := os.Hostname()
+		if configured := strings.TrimSpace(os.Getenv("R2R_SERVICE_INSTANCE_ID")); configured != "" {
+			instanceID = configured
+		}
+		version := strings.TrimSpace(os.Getenv("R2R_APPLICATION_VERSION"))
+		if version == "" {
+			version = "development"
+		}
+		_, _ = operationalDB.Exec(`INSERT PCS.OPERATIONAL_EVENTS
+			(SEVERITY,EVENT_NAME,SERVICE_INSTANCE_ID,APPLICATION_VERSION,REQUEST_ID,TRACE_ID,RUN_ID,ACTOR_ID,HTTP_METHOD,ROUTE,STATUS_CODE,DURATION_MS,RESPONSE_BYTES,ERROR_CODE,ERROR_MESSAGE,CLIENT_ADDRESS)
+			VALUES (@p1,@p2,@p3,@p4,NULLIF(@p5,N''),NULLIF(@p6,''),NULLIF(@p7,N''),NULLIF(@p8,N''),NULLIF(@p9,''),NULLIF(@p10,N''),@p11,@p12,@p13,NULLIF(@p14,N''),NULLIF(@p15,N''),NULLIF(@p16,''))`,
+			level, event, instanceID, version, fieldString(fields, "requestId"), fieldString(fields, "traceId"), fieldString(fields, "runId"), fieldString(fields, "actor"), fieldString(fields, "method"), fieldString(fields, "path"), fieldInt(fields, "status"), fieldInt64(fields, "durationMs"), fieldInt64(fields, "bytes"), fieldString(fields, "errorCode"), fieldString(fields, "error"), fieldString(fields, "clientIp"))
+	}
+}
+
+func fieldString(fields map[string]interface{}, key string) string {
+	if value, ok := fields[key]; ok {
+		return fmt.Sprint(value)
+	}
+	return ""
+}
+func fieldInt(fields map[string]interface{}, key string) interface{} {
+	if value, ok := fields[key]; ok {
+		return value
+	}
+	return nil
+}
+func fieldInt64(fields map[string]interface{}, key string) interface{} {
+	if value, ok := fields[key]; ok {
+		return value
+	}
+	return nil
 }
 
 type responseCapture struct {
@@ -108,6 +144,14 @@ func newRequestID() string {
 	return hex.EncodeToString(raw)
 }
 
+func newRunID() string {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err == nil {
+		return "r2r_" + hex.EncodeToString(raw)
+	}
+	return fmt.Sprintf("r2r_%d", time.Now().UTC().UnixNano())
+}
+
 func clientIP(remoteAddress string) string {
 	host, _, err := net.SplitHostPort(remoteAddress)
 	if err == nil {
@@ -121,6 +165,7 @@ func (s *server) operationalLogging(next http.Handler) http.Handler {
 		started := time.Now()
 		requestID := newRequestID()
 		w.Header().Set("X-Request-ID", requestID)
+		r.Header.Set("X-Request-ID", requestID)
 		capture := &responseCapture{ResponseWriter: w}
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -154,9 +199,54 @@ func (s *server) operationalLogging(next http.Handler) http.Handler {
 				"actor":      actor,
 				"clientIp":   clientIP(r.RemoteAddr),
 			})
+			if actor != "" && r.Method != http.MethodGet && s.store != nil && s.store.IsSQL() {
+				action, entityType, entityID := auditRoute(r.Method, r.URL.Path)
+				outcome := "success"
+				if capture.status == http.StatusForbidden || capture.status == http.StatusUnauthorized {
+					outcome = "denied"
+				} else if capture.status >= 400 {
+					outcome = "failure"
+				}
+				if err := s.store.RecordAudit(actor, action, outcome, entityType, entityID, requestID, clientIP(r.RemoteAddr), map[string]interface{}{"method": r.Method, "route": r.URL.Path, "statusCode": capture.status}); err != nil {
+					operationalLog("ERROR", "audit_event_write_failed", map[string]interface{}{"requestId": requestID, "actor": actor, "error": err.Error()})
+				}
+			}
 		}()
+		if s.store != nil && s.store.IsSQL() && strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/health" {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			err := s.store.Refresh(ctx)
+			cancel()
+			if err != nil {
+				operationalLog("ERROR", "sql_store_refresh_failed", map[string]interface{}{"requestId": requestID, "error": err.Error()})
+				write(capture, 503, map[string]string{"error": "production database is unavailable"})
+				return
+			}
+		}
 		next.ServeHTTP(capture, r)
 	})
+}
+
+func auditRoute(method, path string) (string, string, string) {
+	trimmed := strings.Trim(path, "/")
+	parts := strings.Split(trimmed, "/")
+	entityType, entityID := "api_resource", trimmed
+	if len(parts) >= 2 {
+		entityType = strings.TrimSuffix(parts[1], "s")
+	}
+	if len(parts) >= 3 {
+		entityID = parts[2]
+	}
+	action := strings.ToLower(method) + "." + strings.ReplaceAll(trimmed, "/", ".")
+	if len(parts) >= 4 {
+		action = entityType + "." + parts[3]
+	} else if method == http.MethodPost {
+		action = entityType + ".created"
+	} else if method == http.MethodPut {
+		action = entityType + ".updated"
+	} else if method == http.MethodDelete {
+		action = entityType + ".deleted"
+	}
+	return action, entityType, entityID
 }
 
 func write(w http.ResponseWriter, status int, v interface{}) {
@@ -173,6 +263,20 @@ func (s *server) currentUser(r *http.Request) (user, bool) {
 	cookie, err := r.Cookie("r2r_session")
 	if err != nil {
 		return user{}, false
+	}
+	if s.store != nil && s.store.IsSQL() {
+		registration, ok := s.store.SessionUser(cookie.Value)
+		if !ok {
+			return user{}, false
+		}
+		current := user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, DisplayName: registration.DisplayName, Email: registration.Email, Role: registration.Role, Status: registration.Status}
+		for _, candidate := range s.employees {
+			if strings.EqualFold(candidate.SupervisorID, current.EmployeeID) {
+				current.DirectReports = append(current.DirectReports, candidate.IDNum)
+			}
+		}
+		sort.Strings(current.DirectReports)
+		return current, true
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -209,25 +313,92 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	var login credentials
 	if err := decode(r, &login); err != nil {
+		operationalLog("WARN", "login_rejected", map[string]interface{}{
+			"requestId": r.Header.Get("X-Request-ID"),
+			"errorCode": "invalid_request",
+			"clientIp":  clientIP(r.RemoteAddr),
+		})
 		write(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
 	employee, employeeFound := s.employeeByLoginID(login.Username)
+	if !employeeFound {
+		s.logLoginRejected(r, login.Username, "employee_not_found")
+		write(w, 401, map[string]string{"error": "invalid username or password"})
+		return
+	}
 	registered, registeredFound := s.registeredUser(employee.IDNum)
-	if !employeeFound || !registeredFound || (registered.Status != "" && registered.Status != "active") {
+	if registeredFound && registered.Status != "" && registered.Status != "active" {
+		s.logLoginRejected(r, login.Username, "user_not_active")
 		write(w, 401, map[string]string{"error": "invalid username or password"})
 		return
 	}
-	expectedPassword := s.corporatePasswords[strings.ToLower(employee.LoginID)]
-	if expectedPassword == "" {
-		expectedPassword = registered.Password
-	}
-	if subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(login.Password)) != 1 {
-		write(w, 401, map[string]string{"error": "invalid username or password"})
-		return
+	if s.authenticator != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		result, err := s.authenticator.Authenticate(ctx, employee.LoginID, login.Password)
+		cancel()
+		if err != nil {
+			operationalLog("ERROR", "corporate_authentication_failed", map[string]interface{}{"requestId": r.Header.Get("X-Request-ID"), "error": err.Error()})
+			write(w, http.StatusServiceUnavailable, map[string]string{"error": "corporate authentication service is unavailable"})
+			return
+		}
+		if !result.Authenticated {
+			s.logLoginRejected(r, login.Username, "corporate_credentials_rejected")
+			write(w, 401, map[string]string{"error": "invalid username or password"})
+			return
+		}
+		if result.EmployeeID != "" && !strings.EqualFold(strings.Trim(strings.TrimSpace(result.EmployeeID), "#"), strings.Trim(strings.TrimSpace(employee.IDNum), "#")) {
+			s.logLoginRejected(r, login.Username, "employee_identity_mismatch")
+			write(w, 401, map[string]string{"error": "invalid username or password"})
+			return
+		}
+		if !registeredFound {
+			registration := store.UserRegistration{
+				EmployeeID: employee.IDNum, LoginID: employee.LoginID, DisplayName: employee.DisplayName(),
+				Email: employee.Email, Role: "viewer", Status: "active",
+			}
+			if s.store != nil {
+				created, err := s.store.UpsertUserRegistration(registration)
+				if err != nil {
+					operationalLog("ERROR", "user_auto_registration_failed", map[string]interface{}{"requestId": r.Header.Get("X-Request-ID"), "employeeId": employee.IDNum, "error": err.Error()})
+					write(w, 500, map[string]string{"error": "failed to create R2R user registration"})
+					return
+				}
+				registration = created
+			} else {
+				s.mu.Lock()
+				if s.users == nil {
+					s.users = map[string]user{}
+				}
+				s.users[employee.IDNum] = user{EmployeeID: employee.IDNum, Username: employee.LoginID, DisplayName: employee.DisplayName(), Email: employee.Email, Role: "viewer", Status: "active"}
+				s.mu.Unlock()
+			}
+			registered = user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, DisplayName: registration.DisplayName, Email: registration.Email, Role: registration.Role, Status: registration.Status}
+			registeredFound = true
+			operationalLog("INFO", "user_auto_registered", map[string]interface{}{"requestId": r.Header.Get("X-Request-ID"), "employeeId": employee.IDNum, "role": "viewer"})
+			if s.store != nil {
+				_ = s.store.RecordAudit(employee.IDNum, "user.auto_registered", "success", "user", employee.IDNum, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), map[string]interface{}{"role": "viewer", "source": "corporate_login"})
+			}
+		}
+	} else {
+		if !registeredFound {
+			s.logLoginRejected(r, login.Username, "r2r_registration_not_found")
+			write(w, 401, map[string]string{"error": "invalid username or password"})
+			return
+		}
+		expectedPassword := s.corporatePasswords[strings.ToLower(employee.LoginID)]
+		if expectedPassword == "" {
+			expectedPassword = registered.Password
+		}
+		if subtle.ConstantTimeCompare([]byte(expectedPassword), []byte(login.Password)) != 1 {
+			s.logLoginRejected(r, login.Username, "development_credentials_rejected")
+			write(w, 401, map[string]string{"error": "invalid username or password"})
+			return
+		}
 	}
 	registered.EmployeeID = employee.IDNum
 	registered.Username = employee.LoginID
+	registered.DisplayName = employee.DisplayName()
 	registered.Email = employee.Email
 	if registered.Status == "" {
 		registered.Status = "active"
@@ -245,14 +416,43 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := hex.EncodeToString(tokenBytes)
-	s.mu.Lock()
-	s.sessions[token] = registered
-	s.mu.Unlock()
+	if s.store.IsSQL() {
+		if err := s.store.CreateSession(token, registered.EmployeeID, clientIP(r.RemoteAddr), time.Now().UTC().Add(8*time.Hour)); err != nil {
+			operationalLog("ERROR", "session_create_failed", map[string]interface{}{"actor": registered.EmployeeID, "error": err.Error()})
+			write(w, 500, map[string]string{"error": "failed to create session"})
+			return
+		}
+	} else {
+		s.mu.Lock()
+		s.sessions[token] = registered
+		s.mu.Unlock()
+	}
 	http.SetCookie(w, &http.Cookie{Name: "r2r_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 8 * 60 * 60})
 	write(w, 200, registered)
 }
 
+func (s *server) logLoginRejected(r *http.Request, username, reason string) {
+	operationalLog("WARN", "login_rejected", map[string]interface{}{
+		"requestId": r.Header.Get("X-Request-ID"),
+		"actor":     strings.TrimSpace(username),
+		"errorCode": reason,
+		"clientIp":  clientIP(r.RemoteAddr),
+	})
+}
+
 func (s *server) employeeByLoginID(loginID string) (employeeRecord, bool) {
+	if s.employeeDirectory != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		employee, err := s.employeeDirectory.ByLoginID(ctx, loginID)
+		if err == nil {
+			return employee, true
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			operationalLog("ERROR", "employee_directory_lookup_failed", map[string]interface{}{"error": err.Error()})
+		}
+		return employeeRecord{}, false
+	}
 	for _, employee := range s.employees {
 		if strings.EqualFold(strings.TrimSpace(employee.LoginID), strings.TrimSpace(loginID)) {
 			return employee, true
@@ -262,12 +462,24 @@ func (s *server) employeeByLoginID(loginID string) (employeeRecord, bool) {
 }
 
 func (s *server) employeeByID(employeeID string) (employeeRecord, bool) {
+	if s.employeeDirectory != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		employee, err := s.employeeDirectory.ByEmployeeID(ctx, employeeID)
+		if err == nil {
+			return employee, true
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			operationalLog("ERROR", "employee_directory_lookup_failed", map[string]interface{}{"error": err.Error()})
+		}
+		return employeeRecord{}, false
+	}
 	employee, ok := s.employees[strings.TrimSpace(employeeID)]
 	if ok {
 		return employee, true
 	}
 	for _, candidate := range s.employees {
-		if strings.EqualFold(candidate.IDNum, employeeID) {
+		if strings.EqualFold(strings.TrimSpace(candidate.IDNum), strings.TrimSpace(employeeID)) {
 			return candidate, true
 		}
 	}
@@ -277,14 +489,14 @@ func (s *server) employeeByID(employeeID string) (employeeRecord, bool) {
 func (s *server) registeredUser(employeeID string) (user, bool) {
 	if s.store != nil {
 		for _, registration := range s.store.UserRegistrations() {
-			if strings.EqualFold(registration.EmployeeID, employeeID) {
-				return user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, Email: registration.Email, Role: registration.Role, Status: registration.Status}, true
+			if strings.EqualFold(strings.TrimSpace(registration.EmployeeID), strings.TrimSpace(employeeID)) {
+				return user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, DisplayName: registration.DisplayName, Email: registration.Email, Role: registration.Role, Status: registration.Status}, true
 			}
 		}
 	}
 	for _, candidate := range s.users {
-		if strings.EqualFold(candidate.EmployeeID, employeeID) ||
-			(candidate.EmployeeID == "" && strings.EqualFold(candidate.Username, employeeID)) {
+		if strings.EqualFold(strings.TrimSpace(candidate.EmployeeID), strings.TrimSpace(employeeID)) ||
+			(strings.TrimSpace(candidate.EmployeeID) == "" && strings.EqualFold(strings.TrimSpace(candidate.Username), strings.TrimSpace(employeeID))) {
 			return candidate, true
 		}
 	}
@@ -307,9 +519,13 @@ func (s *server) session(w http.ResponseWriter, r *http.Request) {
 }
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie("r2r_session"); err == nil {
-		s.mu.Lock()
-		delete(s.sessions, cookie.Value)
-		s.mu.Unlock()
+		if s.store.IsSQL() {
+			_ = s.store.RevokeSession(cookie.Value)
+		} else {
+			s.mu.Lock()
+			delete(s.sessions, cookie.Value)
+			s.mu.Unlock()
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: "r2r_session", Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	write(w, 200, map[string]string{"status": "logged_out"})
@@ -338,9 +554,89 @@ func (s *server) dependencies(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, graph)
 }
+func (s *server) refactorParameter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		write(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var request struct {
+		Action  string        `json:"action"`
+		Model   control.Model `json:"model"`
+		OldName string        `json:"oldName"`
+		NewName string        `json:"newName,omitempty"`
+	}
+	if err := decode(r, &request); err != nil {
+		write(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	switch request.Action {
+	case "find":
+		write(w, 200, map[string]interface{}{
+			"usages": control.FindParameterUsages(request.Model, request.OldName),
+		})
+	case "rename":
+		updated, usages, err := control.RenameParameter(request.Model, request.OldName, request.NewName)
+		if err != nil {
+			write(w, 422, map[string]interface{}{"error": err.Error(), "usages": usages})
+			return
+		}
+		write(w, 200, map[string]interface{}{"model": updated, "usages": usages})
+	default:
+		write(w, 400, map[string]string{"error": "action must be find or rename"})
+	}
+}
 func (s *server) prepare(w http.ResponseWriter, r *http.Request) {
 	s.executeRun(w, r, false)
 }
+
+func validatePrepareIndexes(indexes map[string]interface{}, definitions []store.InputDefinition) (map[string]interface{}, error) {
+	registered := map[string]store.InputDefinition{}
+	for _, definition := range definitions {
+		registered[strings.ToLower(strings.TrimSpace(definition.Name))] = definition
+	}
+	normalized := make(map[string]interface{}, len(indexes))
+	for rawName, rawValue := range indexes {
+		name := strings.TrimSpace(rawName)
+		value, ok := rawValue.(string)
+		if name == "" || !ok || strings.TrimSpace(value) == "" {
+			return nil, fmt.Errorf("index %q must be a non-empty string", rawName)
+		}
+		key := strings.ToLower(name)
+		definition, exists := registered[key]
+		if !exists || definition.Category != "index" || definition.Status != "active" {
+			return nil, fmt.Errorf("index %q is not an active registered index", name)
+		}
+		normalized[definition.Name] = strings.TrimSpace(value)
+	}
+	return normalized, nil
+}
+
+func prepareExecutionContext(model control.Model, indexes, externalInputs map[string]interface{}) (map[string]interface{}, error) {
+	context := make(map[string]interface{}, len(indexes)+len(externalInputs))
+	names := map[string]string{}
+	for name, value := range indexes {
+		context[name] = value
+		names[strings.ToLower(name)] = "index"
+	}
+	declared := map[string]control.ExternalInputDefinition{}
+	for _, input := range model.ExternalInputs {
+		declared[strings.ToLower(input.Name)] = input
+	}
+	for rawName, value := range externalInputs {
+		name := strings.TrimSpace(rawName)
+		input, exists := declared[strings.ToLower(name)]
+		if !exists {
+			return nil, fmt.Errorf("external input %q is not declared by the selected model", name)
+		}
+		if category, duplicate := names[strings.ToLower(name)]; duplicate {
+			return nil, fmt.Errorf("input %q cannot be supplied as both %s and external input", name, category)
+		}
+		context[input.Name] = value
+		names[strings.ToLower(input.Name)] = "external input"
+	}
+	return context, nil
+}
+
 func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdaptive bool) {
 	if r.Method != "POST" {
 		write(w, 405, map[string]string{"error": "method not allowed"})
@@ -355,27 +651,27 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		write(w, 422, map[string]string{"error": "dataSamples cannot be supplied to the production prepare API; model data samples come from static definitions or configured SQL sources. Use /api/simulate for caller-supplied test rows"})
 		return
 	}
-	model, reason, err := control.Select(s.store.Config().Models, req.Context)
+	indexes, err := validatePrepareIndexes(req.Indexes, s.store.Config().InputDefinitions)
 	if err != nil {
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
-	hasAdaptive := false
-	for _, parameter := range model.Parameters {
-		if parameter.Adaptive != nil {
-			hasAdaptive = true
-			break
-		}
-	}
-	if hasAdaptive && strings.TrimSpace(req.RunID) == "" {
-		write(w, 400, map[string]string{"error": "runId is required when the model has adaptive parameters"})
+	model, reason, err := control.Select(s.store.Config().Models, indexes)
+	if err != nil {
+		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
+	context, err := prepareExecutionContext(model, indexes, req.ExternalInputs)
+	if err != nil {
+		write(w, 422, map[string]string{"error": err.Error()})
+		return
+	}
+	runID := newRunID()
 	limitResults := map[string]control.OutputValue{}
 	collectLimit := func(result control.OutputValue) { limitResults[result.Parameter] = result }
-	values, samples, unresolvedSQL, err := control.ResolveModelWithLimitCollector(model, req.Context, req.ParameterValues, nil, s.store.AdaptiveValues(model, req.Context), s.sqlParameterResolver(r.Context()), s.sqlDataSampleResolver(r.Context()), collectLimit)
+	values, samples, unresolvedSQL, err := control.ResolveModelWithLimitCollector(model, context, nil, nil, s.store.AdaptiveValues(model, context), s.sqlParameterResolver(r.Context()), s.sqlDataSampleResolver(r.Context()), collectLimit)
 	if err != nil {
-		if writeParameterLimitRejection(w, req, model, err) {
+		if writeParameterLimitRejection(w, runID, model, err) {
 			return
 		}
 		write(w, 422, map[string]string{"error": err.Error()})
@@ -390,7 +686,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		return
 	}
 	adaptiveUpdates := map[string]float64{}
-	if commitAdaptive || !s.store.HasUnfinishedRun(model, req.Context) {
+	if commitAdaptive || !s.store.HasUnfinishedRun(model, context) {
 		adaptiveUpdates, err = control.CalculateAdaptiveUpdatesForSource(model, values, "parameter")
 		if err != nil {
 			write(w, 422, map[string]string{"error": err.Error()})
@@ -398,15 +694,15 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		}
 	}
 	if len(adaptiveUpdates) > 0 {
-		nextAdaptive := s.store.AdaptiveValues(model, req.Context)
+		nextAdaptive := s.store.AdaptiveValues(model, context)
 		for key, value := range adaptiveUpdates {
 			nextAdaptive[key] = value
 		}
 		limitResults = map[string]control.OutputValue{}
 		collectLimit = func(result control.OutputValue) { limitResults[result.Parameter] = result }
-		values, samples, unresolvedSQL, err = control.ResolveModelWithLimitCollector(model, req.Context, values, samples, nextAdaptive, nil, nil, collectLimit)
+		values, samples, unresolvedSQL, err = control.ResolveModelWithLimitCollector(model, context, values, samples, nextAdaptive, nil, nil, collectLimit)
 		if err != nil {
-			if writeParameterLimitRejection(w, req, model, err) {
+			if writeParameterLimitRejection(w, runID, model, err) {
 				return
 			}
 			write(w, 422, map[string]string{"error": err.Error()})
@@ -450,7 +746,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 			"status":      "rejected",
 			"disposition": "run_rejected",
 			"error":       "Run is not allowed: " + strings.Join(rejectionReasons, "; ") + ".",
-			"runId":       req.RunID,
+			"runId":       runID,
 			"controlModel": map[string]interface{}{
 				"id": model.ID, "familyId": model.FamilyID, "name": model.Name,
 				"revision": model.Revision,
@@ -460,22 +756,21 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		return
 	}
 	if commitAdaptive {
-		if err := s.store.CommitAdaptive(model, req.Context, req.RunID, adaptiveUpdates); err != nil {
+		if err := s.store.CommitAdaptive(model, context, runID, adaptiveUpdates); err != nil {
 			write(w, 500, map[string]string{"error": "failed to persist adaptive state"})
 			return
 		}
 	}
-	id := fmt.Sprintf("r2r_%d", time.Now().UnixNano())
-	runID := req.RunID
-	if strings.TrimSpace(runID) == "" {
-		runID = id
-	}
+	id := runID
 	status := "completed"
 	if !commitAdaptive {
 		status = "prepared"
 	}
 	result := map[string]interface{}{"id": id, "runId": runID, "status": status, "controlModel": map[string]interface{}{"id": model.ID, "familyId": model.FamilyID, "name": model.Name, "revision": model.Revision, "owner": model.Owner}, "routing": map[string]string{"reason": reason}, "parameters": values, "adaptiveUpdates": adaptiveUpdates, "dataSamples": samples, "outputs": outputs, "disposition": disposition, "meta": map[string]string{"receivedAt": time.Now().UTC().Format(time.RFC3339)}}
-	record := store.RunRecord{RunID: runID, FamilyID: model.FamilyID, ModelID: model.ID, ModelRevision: model.Revision, Status: status, PreparedAt: time.Now().UTC().Format(time.RFC3339), Context: req.Context, Parameters: values, Outputs: outputs, AdaptiveUpdates: adaptiveUpdates}
+	record := store.RunRecord{RunID: runID, FamilyID: model.FamilyID, ModelID: model.ID, ModelRevision: model.Revision, Status: status, PreparedAt: time.Now().UTC().Format(time.RFC3339), Context: context, Parameters: values, Outputs: outputs, AdaptiveUpdates: adaptiveUpdates, DataSamples: samples, Disposition: disposition}
+	if status != "prepared" {
+		record.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	}
 	var recordErr error
 	var sequence int64
 	if commitAdaptive {
@@ -483,8 +778,12 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	} else {
 		sequence, recordErr = s.store.RecordPreparedRun(record, model, adaptiveUpdates)
 	}
-	if recordErr != nil && !commitAdaptive {
-		write(w, 409, map[string]string{"error": recordErr.Error()})
+	if recordErr != nil {
+		statusCode := 500
+		if !commitAdaptive {
+			statusCode = 409
+		}
+		write(w, statusCode, map[string]string{"error": recordErr.Error()})
 		return
 	}
 	if sequence > 0 {
@@ -493,7 +792,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	write(w, 200, result)
 }
 
-func writeParameterLimitRejection(w http.ResponseWriter, req control.Request, model control.Model, resolveErr error) bool {
+func writeParameterLimitRejection(w http.ResponseWriter, runID string, model control.Model, resolveErr error) bool {
 	var limitErr *control.ParameterLimitError
 	if !errors.As(resolveErr, &limitErr) {
 		return false
@@ -502,7 +801,7 @@ func writeParameterLimitRejection(w http.ResponseWriter, req control.Request, mo
 		"status":      "rejected",
 		"disposition": "run_rejected",
 		"error":       "Run is not allowed: " + limitErr.Message + ".",
-		"runId":       req.RunID,
+		"runId":       runID,
 		"controlModel": map[string]interface{}{
 			"id": model.ID, "familyId": model.FamilyID, "name": model.Name,
 			"revision": model.Revision,
@@ -530,13 +829,39 @@ func (s *server) recentRuns(w http.ResponseWriter, r *http.Request) {
 			summary = fmt.Sprintf("%s = %v %s", run.Outputs[0].Parameter, run.Outputs[0].Value, run.Outputs[0].Unit)
 		}
 		result = append(result, map[string]interface{}{
-			"id": run.RunID, "task": fmt.Sprintf("%v · %v", run.Context["lotId"], run.Context["action"]),
+			"id": run.RunID, "task": recentRunTask(run.Context),
 			"model": fmt.Sprintf("%s · Rev %d", modelNames[run.ModelID], run.ModelRevision), "modelId": run.ModelID,
 			"familyId": run.FamilyID, "status": run.Status, "parameters": run.Parameters, "outputs": run.Outputs,
 			"reason": summary, "time": run.PreparedAt,
 		})
 	}
 	write(w, 200, result)
+}
+
+func recentRunTask(context map[string]interface{}) string {
+	subject := firstContextText(context, "lotId", "lot_id", "wafer_id", "waferId", "material", "machine")
+	action := firstContextText(context, "action", "operation")
+	if subject == "" {
+		subject = "Run"
+	}
+	if action == "" {
+		return subject
+	}
+	return subject + " · " + action
+}
+
+func firstContextText(context map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		value, exists := context[key]
+		if !exists || value == nil {
+			continue
+		}
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" && text != "<nil>" {
+			return text
+		}
+	}
+	return ""
 }
 func (s *server) complete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -648,6 +973,62 @@ func (s *server) revisions(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[2]
 	action := parts[3]
+	if action == "retire" && r.Method == "POST" {
+		if !s.requireRole(w, r, "admin") {
+			return
+		}
+		retired, err := s.store.RetireFamily(id)
+		if err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		write(w, 200, retired)
+		return
+	}
+	if action == "purge-summary" && r.Method == "GET" {
+		if !s.requireRole(w, r, "admin") {
+			return
+		}
+		summary, err := s.store.ModelPurgeSummary(id)
+		if err != nil {
+			write(w, 404, map[string]string{"error": err.Error()})
+			return
+		}
+		write(w, 200, summary)
+		return
+	}
+	if action == "purge" && r.Method == "DELETE" {
+		if !s.requireRole(w, r, "admin") {
+			return
+		}
+		var request struct {
+			ModelName string `json:"modelName"`
+		}
+		if err := decode(r, &request); err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		summary, err := s.store.ModelPurgeSummary(id)
+		if err != nil {
+			write(w, 404, map[string]string{"error": err.Error()})
+			return
+		}
+		if request.ModelName != summary.ModelName {
+			write(w, 400, map[string]string{"error": "typed model name does not match"})
+			return
+		}
+		purged, err := s.store.PurgeFamily(id)
+		if err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		current, _ := s.currentUser(r)
+		if err := s.store.RecordAudit(actorID(current), "model.purged", "success", "model_family", purged.FamilyID, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), purged); err != nil {
+			operationalLog("ERROR", "model_purge_audit_failed", map[string]interface{}{"familyId": purged.FamilyID, "error": err.Error()})
+		}
+		write(w, 200, map[string]interface{}{"status": "purged", "summary": purged})
+		return
+	}
 	if action == "revision" && r.Method == "DELETE" {
 		if !s.requireRole(w, r, "engineer", "engineering_manager", "admin") {
 			return
@@ -727,7 +1108,16 @@ func (s *server) revisions(w http.ResponseWriter, r *http.Request) {
 			write(w, 404, map[string]string{"error": "model not found"})
 			return
 		}
-		write(w, 200, s.store.RunsForFamily(model.FamilyID, time.Now().UTC().Add(-14*24*time.Hour)))
+		days := 14
+		if requested := strings.TrimSpace(r.URL.Query().Get("days")); requested != "" {
+			parsed, err := strconv.Atoi(requested)
+			if err != nil || parsed < 1 || parsed > 90 {
+				write(w, 400, map[string]string{"error": "days must be an integer from 1 to 90"})
+				return
+			}
+			days = parsed
+		}
+		write(w, 200, s.store.RunsForFamily(model.FamilyID, time.Now().UTC().Add(-time.Duration(days)*24*time.Hour)))
 		return
 	}
 	if action == "revisions" && r.Method == "POST" {
@@ -823,17 +1213,13 @@ func modelContract(model control.Model) map[string]interface{} {
 	}
 	sort.Strings(indexNames)
 	for _, name := range indexNames {
-		indexes = append(indexes, map[string]interface{}{"name": name, "type": "string", "required": true, "acceptedValues": []string(model.Indexes[name])})
+		normalizedName := strings.ToLower(name)
+		required := normalizedName == "machine" || normalizedName == "action" || normalizedName == "material"
+		indexes = append(indexes, map[string]interface{}{"name": name, "type": "string", "required": required, "acceptedValues": []string(model.Indexes[name])})
 	}
 	externalInputs := []map[string]interface{}{}
 	for _, input := range model.ExternalInputs {
 		externalInputs = append(externalInputs, map[string]interface{}{"name": input.Name, "type": input.Type, "required": true, "description": input.Description})
-	}
-	overrides := []map[string]interface{}{}
-	for _, parameter := range model.Parameters {
-		if parameter.Source == "sql" {
-			overrides = append(overrides, map[string]interface{}{"name": parameter.Key, "type": parameterDataTypeForContract(parameter), "required": false, "description": parameter.Description})
-		}
 	}
 	outputs := []map[string]interface{}{}
 	definitions := map[string]control.ParameterDefinition{}
@@ -847,7 +1233,7 @@ func modelContract(model control.Model) map[string]interface{} {
 	return map[string]interface{}{
 		"modelId": model.ID, "familyId": model.FamilyID, "revision": model.Revision,
 		"endpoint": "/api/v1/runs/prepare", "indexes": indexes, "externalInputs": externalInputs,
-		"optionalParameterOverrides": overrides, "outputs": outputs,
+		"outputs": outputs,
 	}
 }
 
@@ -926,6 +1312,10 @@ func (s *server) importModel(w http.ResponseWriter, r *http.Request) {
 func (s *server) sources(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/sources/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 2 && parts[1] == "test-query" {
+		s.testSourceQuery(w, r, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "test" {
 		s.testSource(w, r, parts[0])
 		return
@@ -1083,7 +1473,7 @@ func (s *server) applicationUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updated, err := s.store.UpsertUserRegistration(store.UserRegistration{
-			EmployeeID: employee.IDNum, LoginID: employee.LoginID, Email: employee.Email,
+			EmployeeID: employee.IDNum, LoginID: employee.LoginID, DisplayName: employee.DisplayName(), Email: employee.Email,
 			Role: request.Role, Status: request.Status,
 		})
 		if err != nil {
@@ -1099,7 +1489,7 @@ func (s *server) applicationUsers(w http.ResponseWriter, r *http.Request) {
 			}
 			s.mu.Unlock()
 		}
-		write(w, 200, user{EmployeeID: updated.EmployeeID, Username: updated.LoginID, Email: updated.Email, Role: updated.Role, Status: updated.Status})
+		write(w, 200, user{EmployeeID: updated.EmployeeID, Username: updated.LoginID, DisplayName: updated.DisplayName, Email: updated.Email, Role: updated.Role, Status: updated.Status})
 		return
 	}
 	if r.Method == "GET" && employeeID == "" {
@@ -1111,7 +1501,7 @@ func (s *server) applicationUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		for _, registration := range s.store.UserRegistrations() {
-			usersByEmployeeID[registration.EmployeeID] = user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, Email: registration.Email, Role: registration.Role, Status: registration.Status}
+			usersByEmployeeID[registration.EmployeeID] = user{EmployeeID: registration.EmployeeID, Username: registration.LoginID, DisplayName: registration.DisplayName, Email: registration.Email, Role: registration.Role, Status: registration.Status}
 		}
 		users := make([]user, 0, len(usersByEmployeeID))
 		for _, registered := range usersByEmployeeID {
@@ -1144,14 +1534,15 @@ func (s *server) applicationUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	registered := user{
-		EmployeeID: employee.IDNum,
-		Username:   employee.LoginID,
-		Email:      employee.Email,
-		Role:       request.Role,
-		Status:     "active",
+		EmployeeID:  employee.IDNum,
+		Username:    employee.LoginID,
+		DisplayName: employee.DisplayName(),
+		Email:       employee.Email,
+		Role:        request.Role,
+		Status:      "active",
 	}
 	if _, err := s.store.UpsertUserRegistration(store.UserRegistration{
-		EmployeeID: employee.IDNum, LoginID: employee.LoginID, Email: employee.Email, Role: request.Role, Status: "active",
+		EmployeeID: employee.IDNum, LoginID: employee.LoginID, DisplayName: employee.DisplayName(), Email: employee.Email, Role: request.Role, Status: "active",
 	}); err != nil {
 		write(w, 400, map[string]string{"error": err.Error()})
 		return
@@ -1163,6 +1554,31 @@ type simulationRequest struct {
 	CSV        string `json:"csv"`
 	Sequential bool   `json:"sequential"`
 	ModelID    string `json:"modelId,omitempty"`
+}
+
+var indexedSimulationSampleHeader = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\[([0-9]+)\]\.([A-Za-z_][A-Za-z0-9_]*)$`)
+
+func addSimulationSampleValue(samples map[string][]map[string]interface{}, header, rawValue string) bool {
+	if match := indexedSimulationSampleHeader.FindStringSubmatch(header); len(match) == 4 {
+		value := strings.TrimSpace(rawValue)
+		if value == "" {
+			return true
+		}
+		ordinal, _ := strconv.Atoi(match[2])
+		for len(samples[match[1]]) <= ordinal {
+			samples[match[1]] = append(samples[match[1]], map[string]interface{}{})
+		}
+		samples[match[1]][ordinal][match[3]] = value
+		return true
+	}
+	if parts := strings.SplitN(header, ".", 2); len(parts) == 2 {
+		if len(samples[parts[0]]) == 0 {
+			samples[parts[0]] = []map[string]interface{}{{}}
+		}
+		samples[parts[0]][0][parts[1]] = strings.TrimSpace(rawValue)
+		return true
+	}
+	return false
 }
 
 func (s *server) simulate(w http.ResponseWriter, r *http.Request) {
@@ -1204,12 +1620,7 @@ func (s *server) simulate(w http.ResponseWriter, r *http.Request) {
 		for index, header := range headers {
 			header = strings.TrimSpace(header)
 			values[header] = strings.TrimSpace(record[index])
-			if parts := strings.SplitN(header, ".", 2); len(parts) == 2 {
-				if len(samples[parts[0]]) == 0 {
-					samples[parts[0]] = []map[string]interface{}{{}}
-				}
-				samples[parts[0]][0][parts[1]] = strings.TrimSpace(record[index])
-			}
+			addSimulationSampleValue(samples, header, record[index])
 		}
 		var model control.Model
 		var reason string
@@ -1233,6 +1644,19 @@ func (s *server) simulate(w http.ResponseWriter, r *http.Request) {
 			results = append(results, result)
 			continue
 		}
+		dataSampleSources := map[string]string{}
+		for _, definition := range model.DataSamples {
+			source := "model static table"
+			if definition.Source == "sql" {
+				if len(samples[definition.Key]) > 0 {
+					source = "CSV"
+				} else {
+					source = "connected database"
+				}
+			}
+			dataSampleSources[definition.Key] = source
+		}
+		result["dataSampleSources"] = dataSampleSources
 		if coercionErr := coerceSimulationValues(model, values, samples); coercionErr != nil {
 			result["status"] = "failed"
 			result["error"] = coercionErr.Error()
@@ -1404,6 +1828,15 @@ type sourceTestRequest struct {
 	Password string       `json:"password"`
 }
 
+type sourceQueryTestRequest struct {
+	QueryType string                               `json:"queryType"`
+	Query     string                               `json:"query"`
+	Inputs    map[string]interface{}               `json:"inputs"`
+	DataType  string                               `json:"dataType,omitempty"`
+	Columns   []control.DataSampleColumnDefinition `json:"columns,omitempty"`
+	Limit     int                                  `json:"limit,omitempty"`
+}
+
 func sourceDSN(source store.Source, password string) (string, string, error) {
 	switch source.Engine {
 	case "postgres":
@@ -1434,6 +1867,14 @@ func sourceDSN(source store.Source, password string) (string, string, error) {
 	default:
 		return "", "", fmt.Errorf("unsupported database engine %q", source.Engine)
 	}
+}
+
+func readOnlySQL(query string) (string, error) {
+	query = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
+	if !strings.HasPrefix(strings.ToUpper(query), "SELECT ") || strings.Contains(query, ";") {
+		return "", errors.New("query must be one read-only SELECT statement")
+	}
+	return query, nil
 }
 
 var sqlParameterReference = regexp.MustCompile(`@[A-Za-z_][A-Za-z0-9_]*`)
@@ -1630,6 +2071,195 @@ func prepareSQLQuery(engine, query string, resolved map[string]interface{}) (str
 	return rewritten.String(), arguments, nil
 }
 
+func normalizeSQLTestValue(value interface{}, dataType string) (interface{}, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if bytes, ok := value.([]byte); ok {
+		value = string(bytes)
+	}
+	switch dataType {
+	case "number":
+		number, err := strconv.ParseFloat(fmt.Sprint(value), 64)
+		if err != nil {
+			return nil, errors.New("query result must be a number")
+		}
+		return number, nil
+	case "boolean":
+		if boolean, ok := value.(bool); ok {
+			return boolean, nil
+		}
+		boolean, err := strconv.ParseBool(strings.TrimSpace(fmt.Sprint(value)))
+		if err != nil {
+			return nil, errors.New("query result must be boolean")
+		}
+		return boolean, nil
+	case "string":
+		text, ok := value.(string)
+		if !ok {
+			return nil, errors.New("query result must be text")
+		}
+		return text, nil
+	default:
+		return nil, fmt.Errorf("unsupported declared data type %q", dataType)
+	}
+}
+
+func validateSQLTestRows(rows []map[string]interface{}, columns []control.DataSampleColumnDefinition) error {
+	for rowIndex, row := range rows {
+		for _, column := range columns {
+			var raw interface{}
+			found := false
+			for name, value := range row {
+				if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(column.Name)) {
+					raw, found = value, true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("row %d has no declared column %q", rowIndex+1, column.Name)
+			}
+			value, err := normalizeSQLTestValue(raw, column.Type)
+			if err != nil {
+				return fmt.Errorf("row %d column %s: %w", rowIndex+1, column.Name, err)
+			}
+			row[column.Name] = value
+		}
+	}
+	return nil
+}
+
+func (s *server) testSourceQuery(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		write(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.requireRole(w, r, "engineer", "engineering_manager", "admin") {
+		return
+	}
+	source, exists := s.store.Source(id)
+	if !exists {
+		write(w, http.StatusNotFound, map[string]string{"error": "data source not found"})
+		return
+	}
+	var request sourceQueryTestRequest
+	if err := decode(r, &request); err != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if request.QueryType != "parameter" && request.QueryType != "data_sample" {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "queryType must be parameter or data_sample"})
+		return
+	}
+	query, err := readOnlySQL(request.Query)
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	query, arguments, err := prepareSQLQuery(source.Engine, query, request.Inputs)
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	password := ""
+	if source.SecretRef != "" {
+		password = os.Getenv(source.SecretRef)
+		if password == "" {
+			write(w, http.StatusUnprocessableEntity, map[string]string{"error": "secret environment variable " + source.SecretRef + " is not configured"})
+			return
+		}
+	}
+	driver, dsn, err := sourceDSN(source, password)
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	timeout := source.TimeoutSeconds
+	if timeout < 1 {
+		timeout = 5
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Second)
+	defer cancel()
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "open connection: " + err.Error()})
+		return
+	}
+	defer db.Close()
+	started := time.Now()
+	rows, err := db.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "query failed: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+	columnNames, err := rows.Columns()
+	if err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "read columns: " + err.Error()})
+		return
+	}
+	if request.QueryType == "parameter" && len(columnNames) != 1 {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "parameter query must return exactly one column"})
+		return
+	}
+	limit := request.Limit
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	result := make([]map[string]interface{}, 0, limit)
+	truncated := false
+	for rows.Next() {
+		if len(result) == limit {
+			truncated = true
+			break
+		}
+		raw := make([]interface{}, len(columnNames))
+		destinations := make([]interface{}, len(columnNames))
+		for index := range raw {
+			destinations[index] = &raw[index]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			write(w, http.StatusUnprocessableEntity, map[string]string{"error": "scan row: " + err.Error()})
+			return
+		}
+		row := map[string]interface{}{}
+		for index, name := range columnNames {
+			value := raw[index]
+			if bytes, ok := value.([]byte); ok {
+				value = string(bytes)
+			}
+			row[name] = value
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": "read rows: " + err.Error()})
+		return
+	}
+	elapsed := time.Since(started).Milliseconds()
+	if request.QueryType == "parameter" {
+		if len(result) == 0 {
+			write(w, http.StatusUnprocessableEntity, map[string]string{"error": "parameter query returned no rows"})
+			return
+		}
+		value, err := normalizeSQLTestValue(result[0][columnNames[0]], request.DataType)
+		if err != nil {
+			write(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			return
+		}
+		write(w, http.StatusOK, map[string]interface{}{"status": "success", "queryType": "parameter", "value": value, "dataType": request.DataType, "elapsedMs": elapsed})
+		return
+	}
+	if err := validateSQLTestRows(result, request.Columns); err != nil {
+		write(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+		return
+	}
+	write(w, http.StatusOK, map[string]interface{}{"status": "success", "queryType": "data_sample", "columns": columnNames, "rows": result, "rowCount": len(result), "truncated": truncated, "elapsedMs": elapsed})
+}
+
 func (s *server) testSource(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != "POST" {
 		write(w, 405, map[string]string{"error": "method not allowed"})
@@ -1689,10 +2319,62 @@ func (s *server) testSource(w http.ResponseWriter, r *http.Request, id string) {
 func main() {
 	root := "."
 	data := filepath.Join(root, "data", "config.json")
-	st, err := store.Open(data)
+	var st *store.Store
+	var err error
+	connectionString := strings.TrimSpace(os.Getenv("R2R_DATABASE_CONNECTION_STRING"))
+	if connectionString != "" {
+		db, openErr := sql.Open("sqlserver", connectionString)
+		if openErr != nil {
+			err = openErr
+		} else {
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(30 * time.Minute)
+			db.SetConnMaxIdleTime(5 * time.Minute)
+			st, err = store.OpenSQL(db)
+			if err == nil {
+				operationalDB = db
+			}
+		}
+	} else {
+		st, err = store.Open(data)
+	}
 	if err != nil {
 		operationalLog("FATAL", "store_open_failed", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
+	}
+	var authenticator corporateauth.Authenticator
+	authenticationURL := strings.TrimSpace(os.Getenv("R2R_AUTH_API_URL"))
+	if authenticationURL != "" {
+		authenticationClient, clientErr := corporateauth.NewClient(
+			authenticationURL,
+			os.Getenv("R2R_AUTH_API_KEY"),
+			&http.Client{Timeout: 10 * time.Second},
+		)
+		if clientErr != nil {
+			operationalLog("FATAL", "corporate_authentication_configuration_failed", map[string]interface{}{"error": clientErr.Error()})
+			os.Exit(1)
+		}
+		authenticator = authenticationClient
+	}
+	var employeeDirectory employeedirectory.Repository
+	employeeConnectionString := strings.TrimSpace(os.Getenv("R2R_EMPLOYEE_DATABASE_CONNECTION_STRING"))
+	if employeeConnectionString != "" {
+		employeeDB, openErr := sql.Open("sqlserver", employeeConnectionString)
+		err = openErr
+		if err == nil {
+			employeeDB.SetMaxOpenConns(10)
+			employeeDB.SetMaxIdleConns(2)
+			employeeDB.SetConnMaxLifetime(30 * time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = employeeDB.PingContext(ctx)
+			cancel()
+		}
+		if err != nil {
+			operationalLog("FATAL", "employee_database_open_failed", map[string]interface{}{"error": err.Error()})
+			os.Exit(1)
+		}
+		employeeDirectory = employeedirectory.NewSQLRepository(employeeDB)
 	}
 	password := func(name, fallback string) string {
 		if value := os.Getenv(name); value != "" {
@@ -1707,7 +2389,7 @@ func main() {
 		"E301": {IDNum: "E301", LoginID: "engineer2", Email: "engineer2@example.test", SupervisorID: "M200"},
 		"V400": {IDNum: "V400", LoginID: "viewer", Email: "viewer@example.test", SupervisorID: "M200"},
 	}
-	if len(st.UserRegistrations()) == 0 {
+	if !st.IsSQL() && len(st.UserRegistrations()) == 0 {
 		for _, registration := range []store.UserRegistration{
 			{EmployeeID: "A100", LoginID: "admin", Email: "admin@example.test", Role: "admin", Status: "active"},
 			{EmployeeID: "M200", LoginID: "manager", Email: "manager@example.test", Role: "engineering_manager", Status: "active"},
@@ -1721,7 +2403,7 @@ func main() {
 		}
 	}
 	s := &server{
-		store: st, sessions: map[string]user{}, employees: employees,
+		store: st, authenticator: authenticator, employeeDirectory: employeeDirectory, sessions: map[string]user{}, employees: employees,
 		corporatePasswords: map[string]string{
 			"admin": password("R2R_ADMIN_PASSWORD", "admin"), "manager": password("R2R_MANAGER_PASSWORD", "manager"),
 			"engineer": password("R2R_ENGINEER_PASSWORD", "engineer"), "viewer": password("R2R_VIEWER_PASSWORD", "viewer"),
@@ -1730,13 +2412,24 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		write(w, 200, map[string]string{"status": "ok", "service": "go"})
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := st.Ping(ctx); err != nil {
+			write(w, 503, map[string]string{"status": "unavailable", "service": "go", "database": "disconnected"})
+			return
+		}
+		databaseStatus := "json"
+		if st.IsSQL() {
+			databaseStatus = "connected"
+		}
+		write(w, 200, map[string]string{"status": "ok", "service": "go", "database": databaseStatus})
 	})
 	mux.HandleFunc("/api/login", s.login)
 	mux.HandleFunc("/api/session", s.session)
 	mux.HandleFunc("/api/logout", s.logout)
 	mux.HandleFunc("/api/config", s.authenticated(s.config))
 	mux.HandleFunc("/api/dependencies", s.authenticated(s.dependencies))
+	mux.HandleFunc("/api/parameters/refactor", s.authenticated(s.refactorParameter))
 	mux.HandleFunc("/api/v1/runs/prepare", s.prepare)
 	mux.HandleFunc("/api/v1/runs/", s.complete)
 	mux.HandleFunc("/api/runs/recent", s.authenticated(s.recentRuns))
@@ -1750,13 +2443,30 @@ func main() {
 	mux.HandleFunc("/api/simulate", s.authenticated(s.simulate))
 	dist := http.FileServer(http.Dir(filepath.Join(root, "dist")))
 	mux.Handle("/", dist)
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "4173"
+	basePath := applicationBasePath
+	var handler http.Handler = mux
+	if basePath != "" {
+		mounted := http.NewServeMux()
+		mounted.Handle(basePath+"/", http.StripPrefix(basePath, mux))
+		mounted.HandleFunc(basePath, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, basePath+"/", http.StatusPermanentRedirect)
+		})
+		handler = mounted
 	}
-	operationalLog("INFO", "server_started", map[string]interface{}{"port": port})
-	if err := http.ListenAndServe(":"+port, s.operationalLogging(mux)); err != nil {
+	port := listenPort()
+	operationalLog("INFO", "server_started", map[string]interface{}{"port": port, "basePath": basePath})
+	if err := http.ListenAndServe(":"+port, s.operationalLogging(handler)); err != nil {
 		operationalLog("FATAL", "server_stopped", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
 	}
+}
+
+func listenPort() string {
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		return port
+	}
+	if port := strings.TrimSpace(os.Getenv("HTTP_PLATFORM_PORT")); port != "" {
+		return port
+	}
+	return "4173"
 }

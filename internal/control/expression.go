@@ -186,9 +186,9 @@ func SampleExpressionType(expression string, definitions []DataSampleDefinition)
 	switch name {
 	case "first", "nth", "last":
 		return columnType, nil
-	case "contains":
+	case "contains", "matches":
 		if columnType != "string" {
-			return "", fmt.Errorf("CONTAINS requires a text column")
+			return "", fmt.Errorf("%s requires a text column", strings.ToUpper(name))
 		}
 		return "boolean", nil
 	case "count":
@@ -420,6 +420,9 @@ func aggregateSample(function string, selector *ast.SelectorExpr, samples map[st
 			}
 			return 0, fmt.Errorf("data sample %s has no column %q", sampleID.Name, selector.Sel.Name)
 		}
+		if raw == nil {
+			continue
+		}
 		value, err := numberValue(raw)
 		if err != nil {
 			return 0, fmt.Errorf("data sample %s.%s contains a non-numeric value", sampleID.Name, selector.Sel.Name)
@@ -427,10 +430,10 @@ func aggregateSample(function string, selector *ast.SelectorExpr, samples map[st
 		values = append(values, value)
 	}
 	if function == "count" {
-		return float64(len(rows)), nil
+		return float64(len(values)), nil
 	}
 	if len(values) == 0 {
-		return 0, fmt.Errorf("data sample %s has no rows", sampleID.Name)
+		return 0, fmt.Errorf("data sample %s.%s has no non-NULL numeric values", sampleID.Name, selector.Sel.Name)
 	}
 	result := values[0]
 	switch function {

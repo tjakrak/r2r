@@ -157,10 +157,9 @@ func normalizeIndexValues(values []string) IndexValues {
 }
 
 type Request struct {
-	RunID           string                              `json:"runId"`
-	Context         map[string]interface{}              `json:"context"`
-	ParameterValues map[string]interface{}              `json:"parameterValues"`
-	DataSamples     map[string][]map[string]interface{} `json:"dataSamples"`
+	Indexes        map[string]interface{}              `json:"indexes"`
+	ExternalInputs map[string]interface{}              `json:"externalInputs"`
+	DataSamples    map[string][]map[string]interface{} `json:"dataSamples"`
 }
 type OutputValue struct {
 	Parameter       string      `json:"parameter"`
@@ -239,7 +238,7 @@ func Select(models []Model, context map[string]interface{}) (Model, string, erro
 			actual := stringValue(context[key])
 			matched := false
 			for _, expected := range accepted {
-				if strings.EqualFold(actual, expected) {
+				if (expected == "*" && strings.TrimSpace(actual) != "") || strings.EqualFold(actual, expected) {
 					matched = true
 					break
 				}
@@ -285,11 +284,16 @@ func Select(models []Model, context map[string]interface{}) (Model, string, erro
 }
 
 func modelSpecificity(model Model) (int, int) {
+	exactIndexes := 0
 	totalValues := 0
 	for _, values := range model.Indexes {
+		if len(values) == 1 && values[0] == "*" {
+			continue
+		}
+		exactIndexes++
 		totalValues += len(values)
 	}
-	return len(model.Indexes), totalValues
+	return exactIndexes, totalValues
 }
 
 func HasAmbiguousRouting(left, right Model) bool {
@@ -306,7 +310,7 @@ func HasAmbiguousRouting(left, right Model) bool {
 		overlaps := false
 		for _, leftValue := range leftAccepted {
 			for _, rightValue := range rightAccepted {
-				if strings.EqualFold(leftValue, rightValue) {
+				if leftValue == "*" || rightValue == "*" || strings.EqualFold(leftValue, rightValue) {
 					overlaps = true
 					break
 				}
@@ -548,6 +552,11 @@ func ResolveModelWithLimitCollector(model Model, context, supplied map[string]in
 		if resolveErr != nil {
 			return nil, nil, nil, fmt.Errorf("parameter %s: %w", parameter.Key, resolveErr)
 		}
+		if value == nil {
+			values[parameter.Key] = nil
+			resolvedNodes[nodeID] = true
+			continue
+		}
 		if parameter.DataType == "" && parameter.Source == "external" {
 			// Legacy external parameters inherit the caller's already-declared input type.
 		} else if parameterDataType(parameter) == "number" {
@@ -578,6 +587,9 @@ func ResolveModelWithLimitCollector(model Model, context, supplied map[string]in
 
 func applyParameterLimits(parameter ParameterDefinition, value interface{}) (interface{}, OutputValue, bool, error) {
 	result := OutputValue{Parameter: parameter.Key, Unit: parameter.Unit, Value: value, LSL: parameter.LSL, USL: parameter.USL}
+	if value == nil {
+		return nil, result, false, nil
+	}
 	if parameter.LSL == nil && parameter.USL == nil {
 		return value, result, false, nil
 	}
@@ -708,6 +720,9 @@ func evaluateLookup(definition LookupDefinition, resultType string, sampleDefini
 	matches := []interface{}{}
 	for _, row := range samples[sampleDefinition.Key] {
 		actual := row[matchName]
+		if actual == nil {
+			continue
+		}
 		matched := false
 		switch definition.Operator {
 		case "equals":
@@ -735,7 +750,7 @@ func evaluateLookup(definition LookupDefinition, resultType string, sampleDefini
 		}
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("lookup found no matching row in data sample %s", definition.Sample)
+		return nil, nil
 	}
 	if len(matches) > 1 {
 		return nil, fmt.Errorf("lookup found %d matching rows in data sample %s", len(matches), definition.Sample)
@@ -750,6 +765,9 @@ func resolveLogicResult(expression, dataType string, context, values map[string]
 		referenced, exists = context[reference]
 	}
 	if exists {
+		if referenced == nil {
+			return nil, nil
+		}
 		switch dataType {
 		case "number":
 			value, err := numberValue(referenced)
@@ -845,6 +863,9 @@ func resolveLogicOperand(source, name string, context, values map[string]interfa
 }
 
 func compareLogicValue(input interface{}, operator string, expected interface{}) (bool, error) {
+	if input == nil || expected == nil {
+		return false, nil
+	}
 	switch operator {
 	case "equals":
 		return strings.EqualFold(strings.TrimSpace(stringValue(input)), strings.TrimSpace(stringValue(expected))), nil
@@ -1003,6 +1024,13 @@ func ValidateModel(model Model) error {
 	for key, accepted := range model.Indexes {
 		if len(accepted) == 0 {
 			return fmt.Errorf("%s index needs at least one accepted value", key)
+		}
+		if len(accepted) > 1 {
+			for _, value := range accepted {
+				if value == "*" {
+					return fmt.Errorf("%s index wildcard * cannot be combined with other accepted values", key)
+				}
+			}
 		}
 	}
 	if model.Name == "" || model.FamilyID == "" {
@@ -1454,6 +1482,9 @@ func validateStaticDataSample(sample DataSampleDefinition) error {
 			if !exists {
 				return fmt.Errorf("static data sample %s row %d contains unknown column %s", sample.Key, rowIndex+1, name)
 			}
+			if raw == nil {
+				continue
+			}
 			switch dataType {
 			case "number":
 				if _, err := numberValue(raw); err != nil {
@@ -1510,6 +1541,10 @@ func validateResolvedDataSampleRows(sample DataSampleDefinition, rows []map[stri
 			}
 			if !found {
 				return nil, fmt.Errorf("data sample %s row %d has no declared column %q", sample.Key, rowIndex+1, column.Name)
+			}
+			if raw == nil {
+				next[column.Name] = nil
+				continue
 			}
 			switch column.Type {
 			case "number":

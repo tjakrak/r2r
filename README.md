@@ -7,7 +7,8 @@ R2R selects and executes versioned manufacturing control models. An external app
 - React 18 and TypeScript frontend
 - Vite 4 build tooling
 - Go 1.19 HTTP API and model execution engine
-- JSON persistence in `data/config.json` for the prototype
+- SQL Server production persistence in the `PCS` schema
+- JSON persistence in `data/config.json` when production SQL is not configured
 
 ## Run
 
@@ -19,6 +20,23 @@ npm start
 ```
 
 On Windows PowerShell, use `Copy-Item data/config.example.json data/config.json` instead. The local `data/config.json` file is intentionally excluded from Git because the running prototype writes users, models, runs, and source metadata to it.
+
+### Production SQL Server
+
+Set `R2R_DATABASE_CONNECTION_STRING` before starting the backend to make SQL Server authoritative. The backend then loads and writes models, users, sessions, input definitions, data sources, runs, parameter values, outputs, data samples, feedback, adaptive states, audit events, and operational events using the `PCS` schema. It does not read or write `data/config.json` in this mode.
+
+```powershell
+$env:R2R_DATABASE_CONNECTION_STRING = "sqlserver://R2R_APP_LOGIN:URL_ENCODED_PASSWORD@SQLSERVER01.company.local:1433?database=R2RControl&encrypt=true&TrustServerCertificate=false"
+$env:R2R_SERVICE_INSTANCE_ID = "R2R-SERVER-01"
+$env:R2R_APPLICATION_VERSION = "1.0.0"
+npm start
+```
+
+The startup fails if SQL Server is unavailable or if the expected `PCS` tables do not match the deployed contract. `GET /api/health` reports `database: connected` in SQL mode. Copy `.env.example` only as a reference; do not commit a real password or connection string.
+
+Set `R2R_EMPLOYEE_DATABASE_CONNECTION_STRING` to enable the production employee-directory placeholder. That SQL Server database must expose a read-only `dbo.R2R_EMPLOYEE_DIRECTORY` table or view with `IDNUM`, `LOGINID`, `EMAIL`, and `SUPID` columns. When the variable is absent, development mode uses the hardcoded test employee records. The credential-verification REST API remains a separate integration.
+
+Set `R2R_AUTH_API_URL` (currently `http://hwtb1web01.headway.com/HWT.API/validateuser`) to enable corporate credential verification. The backend locally converts the password to UTF-8 bytes, applies standard Base64 encoding, and posts `{"username":"...","password":"<base64 value>"}` to `validateuser`. Authentication succeeds when the response contains `{"data":{"status":"success","userInfo":{"id":"..."}}}`; `userInfo.id` must match the employee-directory ID. An optional bearer credential can be provided with `R2R_AUTH_API_KEY`. When the authentication URL is absent, the backend retains the environment-based development passwords.
 
 Open [http://localhost:4173](http://localhost:4173). The web interface manages models and revisions; model execution is performed by external applications through the API.
 
@@ -37,29 +55,32 @@ For testing Add User, employee `E301` (`engineer2` / `engineer2`) exists in the 
 
 ## Execution workflow
 
-1. The caller sends one actual value for required `machine`, `action`, and `material` indexes plus any optional model indexes and external application values. A model may accept multiple values for each index.
+1. The caller sends one actual value for required `machine`, `action`, and `material` indexes plus any optional model indexes and external application values. A model may accept multiple values for each index. An index whose only accepted value is `*` matches any non-empty caller value; an exact matching model takes priority over a wildcard model.
 2. R2R selects the most-specific enabled model whose revision status is `approved`.
 3. Parameters are resolved in dependency order from either a scalar SQL query or a typed expression. Expressions cover constants, references, calculations, conditions, sample functions, and typed table lookups.
 4. Named SQL or static data samples resolve after their dependencies and provide bounded, typed tabular inputs. Production callers cannot replace those rows.
 5. The configured output list returns selected resolved parameters without another calculation layer.
 
+Engineers, engineering managers, and administrators can run an isolated read-only query test from SQL parameter and SQL data-sample editors. The tester requests values for referenced `@inputs`, uses the configured data-source secret and timeout, validates the declared scalar or tabular result type, and limits data-sample previews to at most 100 rows without saving the model.
+
 ```bash
 curl -X POST http://localhost:4173/api/v1/runs/prepare \
   -H "Content-Type: application/json" \
   -d '{
-    "runId": "RUN-2026-00042",
-    "context": {
-      "lotId": "LOT-042",
+    "indexes": {
       "machine": "PROCESS-01",
       "action": "CALCULATE",
-      "material": "PRODUCT_A",
-      "operation": "REWORK",
+      "material": "PRODUCT_A"
+    },
+    "externalInputs": {
+      "lotId": "LOT-042",
+      "operation": "ARI170",
       "measured_cd": 1.5
     }
   }'
 ```
 
-The included draft example demonstrates all expression forms. References use `@name`; functions do not. The popup expression editor groups operators, conditional statements, aggregates, math functions, data-sample functions, and string functions. Expressions support typed literals, comparisons, `IF(condition, result, else_result)`, numerical operators, common math functions, `MIN`, `MAX`, `AVG`, `MEDIAN`, `RANGE`, `STDEV`, `SUM`, and `COUNT` aggregates, positional `FIRST`, `NTH`, and `LAST`, typed lookups, and string functions such as `SUBSTR`, `REPLACE`, `CONCAT`, and `TRIM`. `CONTAINS(@sample.text_column, "value")` performs a case-insensitive search across the column and returns a boolean. `NTH(@sample.column, 2)` selects the second row using a 1-based position. Use a deterministic SQL `ORDER BY` whenever row order matters.
+The included draft example demonstrates all expression forms. References use `@name`; functions do not. The popup expression editor groups operators, conditional statements, aggregates, math functions, data-sample functions, and string functions. Expressions support typed literals, comparisons, `IF(condition, result, else_result)`, `IS_NULL(value)`, numerical operators, common math functions, `MIN`, `MAX`, `AVG`, `MEDIAN`, `RANGE`, `STDEV`, `SUM`, and `COUNT` aggregates, positional `FIRST`, `NTH`, and `LAST`, typed lookups, and string functions such as `SUBSTR`, `REPLACE`, `CONCAT`, and `TRIM`. `LOOKUP_ONE` and `LOOKUP_FIRST` return null when no row matches; use `IS_NULL` when fallback behavior is required. `CONTAINS(@sample.text_column, "value")` performs a case-insensitive exact membership check across the column and returns a boolean. `MATCHES(@sample.text_column, "^pattern$")` performs regular-expression matching. `NTH(@sample.column, 2)` selects the second row using a 1-based position. Use a deterministic SQL `ORDER BY` whenever row order matters.
 
 ## Model definition
 
@@ -111,11 +132,11 @@ The R2R production repository uses SQL Server. External calculation data may com
 
 The Simulation page follows a model-first workflow: select an active model, download its generated CSV template, populate and upload the file, then run the simulation. After a run, **View JSON exchange** shows the exact simulation request and response. Draft simulation provides the same template and exchange viewer for the selected revision.
 
-Scalar SQL parameters and tabular data samples execute one read-only `SELECT` against their configured external source. Values are bound through `database/sql` and are never interpolated into query text. Declared SQL sample schemas normalize and validate returned column names and types before expressions or lookups execute. Data-sample results are limited to the configured record count. The source's `secretRef` names the environment variable containing its password. Production callers may override scalar SQL parameters through `parameterValues`; model data samples always come from static definitions or configured SQL sources. Caller-supplied sample rows are confined to the Simulation API.
+Scalar SQL parameters and tabular data samples execute one read-only `SELECT` against their configured external source. Values are bound through `database/sql` and are never interpolated into query text. Declared SQL sample schemas normalize and validate returned column names and types before expressions or lookups execute. Data-sample results are limited to the configured record count. The source's `secretRef` names the environment variable containing its password. Production callers send routing values in `indexes` and declared calculation inputs in `externalInputs`; approved parameter definitions always resolve inside R2R. Only `machine`, `action`, and `material` are globally required indexes. Additional registered indexes may be omitted when a less-specific approved model is intended. Caller-supplied sample rows and test values are confined to the Simulation API.
 
 Static data samples store their typed column definitions and rows directly with the model revision. They resolve without a database connection and support the same aggregate and positional expressions as SQL samples.
 
-Models with adaptive parameters require a unique `runId`. The current value is used for the run, the next value is calculated after all parameters resolve, and the update is persisted only after successful output evaluation. The response exposes the committed next values in `adaptiveUpdates`.
+R2R generates a unique `runId` for every successfully prepared run and returns it in the response. The caller must retain that ID and use it to complete the run. For adaptive parameters, the current value is used for the run, the next value is calculated after all parameters resolve, and the update is persisted only after successful output evaluation. The response exposes the committed next values in `adaptiveUpdates`.
 
 After calculating a proposed adaptive value, R2R compares its change with the configured deadband. Changes at or below the deadband are ignored. A larger change is limited to the configured maximum adjustment per run before it is persisted.
 

@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -38,6 +39,9 @@ func EvaluateTypedExpression(expression, expectedType string, model Model, conte
 	value, err := evalTypedNode(node, model, context, values, samples)
 	if err != nil {
 		return nil, err
+	}
+	if value == nil {
+		return nil, nil
 	}
 	if actual := runtimeValueType(value); actual != expectedType {
 		return nil, fmt.Errorf("expression returns %s, but parameter result is %s", typeLabel(actual), typeLabel(expectedType))
@@ -128,6 +132,13 @@ func evalTypedNode(node ast.Expr, model Model, context, values map[string]interf
 			}
 			return evalTypedNode(n.Args[2], model, context, values, samples)
 		}
+		if name == "IS_NULL" {
+			if len(n.Args) != 1 {
+				return nil, fmt.Errorf("IS_NULL requires one value")
+			}
+			value, err := evalTypedNode(n.Args[0], model, context, values, samples)
+			return value == nil, err
+		}
 		if name == "LOOKUP_ONE" || name == "LOOKUP_FIRST" {
 			text, err := expressionText(n)
 			if err != nil {
@@ -139,8 +150,8 @@ func evalTypedNode(node ast.Expr, model Model, context, values map[string]interf
 			}
 			return EvaluateLookupFormula(text, resultType, model.DataSamples, context, values, samples)
 		}
-		if name == "CONTAINS" {
-			return evaluateSampleContains(n, model, context, values, samples)
+		if name == "CONTAINS" || name == "MATCHES" {
+			return evaluateSampleMembership(name, n, model, context, values, samples)
 		}
 		if name == "SUBSTR" || name == "REPLACE" || name == "LOWER" || name == "UPPER" || name == "TRIM" || name == "CONCAT" || name == "LEN" {
 			return evalStringCall(name, n.Args, model, context, values, samples)
@@ -180,7 +191,7 @@ func TypedExpressionDependencies(expression string) (references, samples []strin
 					sampleSet[strings.TrimPrefix(sample.Name, "ref__")] = true
 					delete(referenceSet, strings.TrimPrefix(sample.Name, "ref__"))
 				}
-			} else if name == "CONTAINS" || name == "FIRST" || name == "NTH" || name == "LAST" || name == "MIN" || name == "MAX" || name == "AVG" || name == "MEDIAN" || name == "RANGE" || name == "STDEV" || name == "SUM" || name == "COUNT" {
+			} else if name == "CONTAINS" || name == "MATCHES" || name == "FIRST" || name == "NTH" || name == "LAST" || name == "MIN" || name == "MAX" || name == "AVG" || name == "MEDIAN" || name == "RANGE" || name == "STDEV" || name == "SUM" || name == "COUNT" {
 				if selector, ok := selectorArgument(value); ok {
 					if sample, ok := selector.X.(*ast.Ident); ok {
 						sampleSet[strings.TrimPrefix(sample.Name, "ref__")] = true
@@ -312,17 +323,17 @@ func evalStringCall(name string, arguments []ast.Expr, model Model, context, val
 	return nil, fmt.Errorf("unsupported string function %s", name)
 }
 
-func evaluateSampleContains(call *ast.CallExpr, model Model, context, values map[string]interface{}, samples map[string][]map[string]interface{}) (interface{}, error) {
+func evaluateSampleMembership(name string, call *ast.CallExpr, model Model, context, values map[string]interface{}, samples map[string][]map[string]interface{}) (interface{}, error) {
 	if len(call.Args) != 2 {
-		return nil, fmt.Errorf("CONTAINS requires sample.column and text")
+		return nil, fmt.Errorf("%s requires sample.column and text", name)
 	}
 	selector, ok := call.Args[0].(*ast.SelectorExpr)
 	if !ok {
-		return nil, fmt.Errorf("CONTAINS first argument must use @sample.column")
+		return nil, fmt.Errorf("%s first argument must use @sample.column", name)
 	}
 	sample, ok := selector.X.(*ast.Ident)
 	if !ok {
-		return nil, fmt.Errorf("CONTAINS first argument must use @sample.column")
+		return nil, fmt.Errorf("%s first argument must use @sample.column", name)
 	}
 	sampleName := strings.TrimPrefix(sample.Name, "ref__")
 	needleValue, err := evalTypedNode(call.Args[1], model, context, values, samples)
@@ -331,7 +342,14 @@ func evaluateSampleContains(call *ast.CallExpr, model Model, context, values map
 	}
 	needle, ok := needleValue.(string)
 	if !ok {
-		return nil, fmt.Errorf("CONTAINS search value must be text")
+		return nil, fmt.Errorf("%s search value must be text", name)
+	}
+	var pattern *regexp.Regexp
+	if name == "MATCHES" {
+		pattern, err = regexp.Compile(needle)
+		if err != nil {
+			return nil, fmt.Errorf("MATCHES pattern is invalid: %w", err)
+		}
 	}
 	rows, exists := samples[sampleName]
 	if !exists {
@@ -342,11 +360,14 @@ func evaluateSampleContains(call *ast.CallExpr, model Model, context, values map
 		if !exists {
 			return nil, fmt.Errorf("data sample %s has no column %q", sampleName, selector.Sel.Name)
 		}
+		if raw == nil {
+			continue
+		}
 		text, ok := raw.(string)
 		if !ok {
-			return nil, fmt.Errorf("CONTAINS requires a text column")
+			return nil, fmt.Errorf("%s requires a text column", name)
 		}
-		if strings.Contains(strings.ToLower(text), strings.ToLower(needle)) {
+		if (name == "CONTAINS" && strings.EqualFold(text, needle)) || (name == "MATCHES" && pattern.MatchString(text)) {
 			return true, nil
 		}
 	}
@@ -364,6 +385,13 @@ func evalTypedBinary(op token.Token, left, right interface{}) (interface{}, erro
 			return l && r, nil
 		}
 		return l || r, nil
+	}
+	// NULL only participates in IS_NULL. Ordinary comparisons with it do not match.
+	if left == nil || right == nil {
+		switch op {
+		case token.EQL, token.NEQ, token.GTR, token.GEQ, token.LSS, token.LEQ:
+			return false, nil
+		}
 	}
 	if op == token.EQL || op == token.NEQ {
 		if runtimeValueType(left) != runtimeValueType(right) {
@@ -527,13 +555,22 @@ func inferTypedNode(node ast.Expr, model Model, refs map[string]string) (string,
 			}
 			return left, nil
 		}
+		if name == "IS_NULL" {
+			if len(n.Args) != 1 {
+				return "", fmt.Errorf("IS_NULL requires one value")
+			}
+			if _, err := inferTypedNode(n.Args[0], model, refs); err != nil {
+				return "", err
+			}
+			return "boolean", nil
+		}
 		text, err := expressionText(n)
 		if err != nil {
 			return "", err
 		}
-		if name == "CONTAINS" {
+		if name == "CONTAINS" || name == "MATCHES" {
 			if len(n.Args) != 2 {
-				return "", fmt.Errorf("CONTAINS requires sample.column and text")
+				return "", fmt.Errorf("%s requires sample.column and text", name)
 			}
 			if _, err := SampleExpressionType(text, model.DataSamples); err != nil {
 				return "", err
@@ -543,7 +580,7 @@ func inferTypedNode(node ast.Expr, model Model, refs map[string]string) (string,
 				return "", err
 			}
 			if valueType != "string" {
-				return "", fmt.Errorf("CONTAINS search value must be text")
+				return "", fmt.Errorf("%s search value must be text", name)
 			}
 			return "boolean", nil
 		}

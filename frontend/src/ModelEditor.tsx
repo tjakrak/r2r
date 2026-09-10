@@ -4,15 +4,18 @@ import {
   ChevronDown,
   Code2,
   Copy,
+  Pencil,
   Network,
   Plus,
   RotateCcw,
+  Search,
   ShieldCheck,
   Trash2,
   X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
+import { appPath } from './paths';
 
 type Adaptive = {
   initialValue: number;
@@ -86,7 +89,7 @@ type DataSample = {
   dataSourceId?: string;
   query: string;
   columns?: DataSampleColumn[];
-  rows?: Record<string, string | number | boolean>[];
+  rows?: Record<string, string | number | boolean | null>[];
   limit: number;
 };
 type Source = {
@@ -115,7 +118,36 @@ type DependencyGraph = {
   edges: { from: string; to: string; reasons?: string[] }[];
   order: string[];
 };
+type ParameterUsage = {
+  section: 'parameter' | 'data-sample' | 'outputs' | 'partition';
+  location: string;
+  detail: string;
+  parameterIndex?: number;
+};
 const DataSourcesContext = createContext<Source[]>([]);
+
+function refactorModel(form: any) {
+  return {
+    id: form.id || 'DRAFT_REFACTOR',
+    familyId: form.familyId || 'DRAFT_REFACTOR_FAMILY',
+    name: form.name || 'Draft model',
+    owner: form.owner || 'draft',
+    revision: form.revision || 1,
+    status: 'draft',
+    changeNote: form.note || 'Parameter refactor',
+    createdBy: form.createdBy || 'draft',
+    createdAt: form.createdAt || '',
+    description: form.description || '',
+    indexes: form.indexes,
+    externalInputs: form.externalInputs,
+    feedbackInputs: form.feedbackInputs || [],
+    executionPolicy: form.executionPolicy,
+    parameters: form.parameters,
+    dataSamples: form.dataSamples,
+    outputs: form.outputs,
+    enabled: false,
+  };
+}
 const emptyParameter = (): Parameter => ({
   key: '',
   description: '',
@@ -129,7 +161,7 @@ const emptySample = (): DataSample => ({
   description: '',
   source: 'sql',
   query: '',
-  columns: [{ name: 'column_name', type: 'string' }],
+  columns: [],
   rows: [],
   limit: 10,
 });
@@ -139,7 +171,11 @@ const emptyExternalInput = (): ExternalInput => ({
   type: 'string',
 });
 
-type SQLReference = { name: string; source: 'External input' | 'Parameter' };
+type SQLReference = {
+  name: string;
+  source: string;
+  dataType?: 'string' | 'number' | 'boolean';
+};
 
 function SQLAutocomplete({
   value,
@@ -235,6 +271,206 @@ function SQLAutocomplete({
   );
 }
 
+type SQLQueryTestResult = {
+  status: 'success';
+  queryType: 'parameter' | 'data_sample';
+  value?: unknown;
+  dataType?: string;
+  columns?: string[];
+  rows?: Record<string, unknown>[];
+  rowCount?: number;
+  truncated?: boolean;
+  elapsedMs: number;
+};
+
+function SQLQueryTester({
+  dataSourceId,
+  query,
+  queryType,
+  dataType,
+  columns,
+  limit,
+  references,
+}: {
+  dataSourceId?: string;
+  query: string;
+  queryType: 'parameter' | 'data_sample';
+  dataType?: 'string' | 'number' | 'boolean';
+  columns?: DataSampleColumn[];
+  limit?: number;
+  references: SQLReference[];
+}) {
+  const referencedNames = Array.from(
+    new Set(Array.from(query.matchAll(/@([A-Za-z_][A-Za-z0-9_]*)/g), (match) => match[1])),
+  );
+  const referenced = referencedNames.map(
+    (name) =>
+      references.find((reference) => reference.name.toLowerCase() === name.toLowerCase()) || {
+        name,
+        source: 'Query parameter',
+        dataType: 'string' as const,
+      },
+  );
+  const referenceKey = referenced
+    .map((reference) => `${reference.name}:${reference.dataType || 'string'}`)
+    .join('|');
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<SQLQueryTestResult>();
+
+  useEffect(() => {
+    setInputs((current) =>
+      Object.fromEntries(referenced.map((reference) => [reference.name, current[reference.name] || ''])),
+    );
+    setResult(undefined);
+    setError('');
+  }, [referenceKey]);
+
+  const convertedInputs = () =>
+    Object.fromEntries(
+      referenced.map((reference) => {
+        const raw = inputs[reference.name] || '';
+        if (reference.dataType === 'number') return [reference.name, Number(raw)];
+        if (reference.dataType === 'boolean') return [reference.name, raw === 'true'];
+        return [reference.name, raw];
+      }),
+    );
+
+  const test = async () => {
+    if (!dataSourceId || !query.trim()) return;
+    setTesting(true);
+    setError('');
+    setResult(undefined);
+    try {
+      const response = await fetch(
+        appPath(`/api/sources/${encodeURIComponent(dataSourceId)}/test-query`),
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            queryType,
+            query,
+            inputs: convertedInputs(),
+            dataType,
+            columns: columns || [],
+            limit,
+          }),
+        },
+      );
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || 'Query test failed');
+      setResult(body);
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const missingInput = referenced.some(
+    (reference) => reference.dataType !== 'boolean' && !(inputs[reference.name] || '').trim(),
+  );
+
+  return (
+    <div className="sql-query-tester span-three">
+      <div className="sql-query-test-heading">
+        <div>
+          <strong>Test query</strong>
+          <small>Runs this read-only query without saving the model.</small>
+        </div>
+        <button
+          type="button"
+          className="secondary"
+          disabled={testing || !dataSourceId || !query.trim() || missingInput}
+          onClick={test}
+        >
+          <Code2 /> {testing ? 'Testing…' : 'Run test'}
+        </button>
+      </div>
+      {referenced.length > 0 && (
+        <div className="sql-query-test-inputs">
+          {referenced.map((reference) => (
+            <label key={reference.name}>
+              @{reference.name}
+              {reference.dataType === 'boolean' ? (
+                <select
+                  value={inputs[reference.name] || 'false'}
+                  onChange={(event) =>
+                    setInputs({ ...inputs, [reference.name]: event.target.value })
+                  }
+                >
+                  <option value="false">False</option>
+                  <option value="true">True</option>
+                </select>
+              ) : (
+                <input
+                  type={reference.dataType === 'number' ? 'number' : 'text'}
+                  value={inputs[reference.name] || ''}
+                  onChange={(event) =>
+                    setInputs({ ...inputs, [reference.name]: event.target.value })
+                  }
+                  placeholder={`${reference.source} · ${reference.dataType || 'string'}`}
+                />
+              )}
+            </label>
+          ))}
+        </div>
+      )}
+      {error && <div className="connection-result failed"><strong>Query failed</strong><span>{error}</span></div>}
+      {result?.queryType === 'parameter' && (
+        <div className="connection-result success">
+          <strong>Result: {result.value === null ? 'NULL' : String(result.value)}</strong>
+          <span>{result.dataType} · {result.elapsedMs} ms</span>
+        </div>
+      )}
+      {result?.queryType === 'data_sample' && (
+        <div className="sql-query-test-result">
+          <div><strong>{result.rowCount || 0} rows</strong><span>{result.elapsedMs} ms{result.truncated ? ' · preview limited' : ''}</span></div>
+          <div className="sql-query-test-table-wrap">
+            <table>
+              <thead><tr>{(result.columns || []).map((column) => <th key={column}>{column}</th>)}</tr></thead>
+              <tbody>
+                {(result.rows || []).map((row, rowIndex) => (
+                  <tr key={rowIndex}>{(result.columns || []).map((column) => <td key={column}>{row[column] == null ? 'NULL' : String(row[column])}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function highlightExpression(expression: string) {
+  const pattern = /"(?:\\.|[^"\\])*"|@[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?|\b(?:AND|OR|true|false)\b|>=|<=|==|!=|[+*/<>-]|\b\d+(?:\.\d+)?\b|[A-Za-z_][A-Za-z0-9_]*|\s+|./gi;
+  const tokens = expression.match(pattern) || [];
+  let offset = 0;
+  return tokens.map((token, index) => {
+    const start = offset;
+    offset += token.length;
+    if (/^"/.test(token)) return <span className="expression-token string" key={index}>{token}</span>;
+    if (/^@/.test(token)) {
+      const dot = token.indexOf('.');
+      return (
+        <span className="expression-token reference" key={index}>
+          <span>{dot < 0 ? token : token.slice(0, dot)}</span>
+          {dot >= 0 && <span className="column">{token.slice(dot)}</span>}
+        </span>
+      );
+    }
+    if (/^(AND|OR)$/i.test(token)) return <span className="expression-token keyword" key={index}>{token}</span>;
+    if (/^(true|false)$/i.test(token)) return <span className="expression-token boolean" key={index}>{token}</span>;
+    if (/^(>=|<=|==|!=|[+*/<>-])$/.test(token)) return <span className="expression-token operator" key={index}>{token}</span>;
+    if (/^\d/.test(token)) return <span className="expression-token number" key={index}>{token}</span>;
+    if (/^[A-Za-z_]/.test(token) && /^\s*\(/.test(expression.slice(start + token.length)))
+      return <span className="expression-token function" key={index}>{token}</span>;
+    return token;
+  });
+}
+
 function ExpressionAutocomplete({
   value,
   references,
@@ -254,22 +490,28 @@ function ExpressionAutocomplete({
   multiline?: boolean;
 }) {
   const inputRef = useRef<any>(null);
+  const highlightRef = useRef<HTMLPreElement>(null);
   const [matches, setMatches] = useState<
     { name: string; source: string; plain?: boolean; kind?: 'value' | 'sample' | 'sample-column' }[]
   >([]);
   const [activeIndex, setActiveIndex] = useState(0);
   const updateMatches = (text: string, caret: number) => {
     const before = text.slice(0, caret);
-    const referenceToken = before.match(/@([A-Za-z_][A-Za-z0-9_]*)?$/);
+    const referenceToken = before.match(
+      /@([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]*)?)?$/,
+    );
     const functionToken = before.match(/(?:^|[^@A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)$/);
     if (referenceToken) {
       const query = (referenceToken[1] || '').toLowerCase();
       const prefix = before.slice(0, before.length - referenceToken[0].length);
-      const kind =
-        /(?:CONTAINS|FIRST|NTH|LAST|MIN|MAX|AVG|MEDIAN|RANGE|STDEV|SUM|COUNT)\s*\(\s*$/i.test(
-          prefix,
-        )
+      const kind = query.includes('.')
+        ? 'sample-column'
+        : /(?:CONTAINS|MATCHES|FIRST|NTH|LAST|MIN|MAX|AVG|MEDIAN|RANGE|STDEV|SUM|COUNT)\s*\(\s*$/i.test(
+            prefix,
+          )
           ? 'sample-column'
+          : /LOOKUP_(?:ONE|FIRST)\s*\([^)]*(?:,|\bAND|\bOR)\s*$/i.test(prefix)
+            ? 'sample-column'
           : /LOOKUP_(?:ONE|FIRST)\s*\(\s*$/i.test(prefix)
             ? 'sample'
             : 'value';
@@ -307,7 +549,7 @@ function ExpressionAutocomplete({
     const before = value.slice(0, caret);
     const token = reference.plain
       ? before.match(/(?:^|[^@A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)$/)
-      : before.match(/@([A-Za-z_][A-Za-z0-9_]*)?$/);
+      : before.match(/@([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]*)?)?$/);
     if (!token) return;
     const start = reference.plain ? caret - token[1].length : caret - token[0].length;
     const inserted = reference.plain ? reference.name : `@${reference.name}`;
@@ -330,10 +572,18 @@ function ExpressionAutocomplete({
     placeholder,
     onChange: (event: any) => {
       onChange(event.target.value);
-      updateMatches(event.target.value, event.target.selectionStart ?? event.target.value.length);
+      const caret = event.target.selectionStart ?? event.target.value.length;
+      updateMatches(event.target.value, caret);
     },
-    onClick: (event: any) =>
-      updateMatches(event.currentTarget.value, event.currentTarget.selectionStart ?? 0),
+    onClick: (event: any) => {
+      const caret = event.currentTarget.selectionStart ?? 0;
+      updateMatches(event.currentTarget.value, caret);
+    },
+    onScroll: (event: any) => {
+      if (!highlightRef.current) return;
+      highlightRef.current.scrollTop = event.currentTarget.scrollTop;
+      highlightRef.current.scrollLeft = event.currentTarget.scrollLeft;
+    },
     onKeyDown: (event: any) => {
       if (!matches.length) return;
       if (event.key === 'ArrowDown') {
@@ -351,6 +601,12 @@ function ExpressionAutocomplete({
   };
   return (
     <div className={`sql-autocomplete logic-autocomplete ${multiline ? 'multiline' : ''}`}>
+      {multiline && (
+        <pre className="expression-highlight" aria-hidden="true" ref={highlightRef}>
+          {highlightExpression(value)}
+          {'\n'}
+        </pre>
+      )}
       {multiline ? <textarea {...editorProps} /> : <input {...editorProps} />}
       {matches.length > 0 && (
         <div className="sql-autocomplete-menu">
@@ -378,6 +634,182 @@ type ExpressionReference = {
   plain?: boolean;
   kind?: 'value' | 'sample' | 'sample-column';
 };
+
+const functionHelp: Record<string, { signature: string; description: string }> = {
+  IF: {
+    signature: 'IF(condition, result_if_true, result_if_false)',
+    description: 'Evaluates a condition and returns one of two results.',
+  },
+  IS_NULL: {
+    signature: 'IS_NULL(@value)',
+    description: 'Returns true when the supplied parameter or lookup result is null.',
+  },
+  LOOKUP_ONE: {
+    signature: 'LOOKUP_ONE(@sample, filter, @sample.return_column)',
+    description: 'Returns null for no match, the selected value for one match, and errors for multiple matches.',
+  },
+  LOOKUP_FIRST: {
+    signature: 'LOOKUP_FIRST(@sample, filter, @sample.return_column)',
+    description: 'Returns null for no match or the selected column from the first matching row.',
+  },
+  CONTAINS: {
+    signature: 'CONTAINS(@sample.column, text)',
+    description: 'Returns true when any row equals the supplied text, ignoring letter case.',
+  },
+  MATCHES: {
+    signature: 'MATCHES(@sample.column, pattern)',
+    description: 'Returns true when any row matches a Go-compatible regular expression.',
+  },
+  FIRST: { signature: 'FIRST(@sample.column)', description: 'Returns the first row value.' },
+  NTH: { signature: 'NTH(@sample.column, row)', description: 'Returns a row by its 1-based position.' },
+  LAST: { signature: 'LAST(@sample.column)', description: 'Returns the last row value.' },
+};
+
+for (const name of ['AVG', 'MAX', 'MEDIAN', 'MIN', 'RANGE', 'STDEV', 'SUM', 'COUNT']) {
+  functionHelp[name] = {
+    signature: `${name}(@sample.column)`,
+    description: `Calculates ${name.toLowerCase()} over the selected data-sample column.`,
+  };
+}
+for (const name of ['ABS', 'CEIL', 'COS', 'EXP', 'FLOOR', 'LOG', 'ROUND', 'SIN', 'SQRT', 'TAN']) {
+  functionHelp[name] = {
+    signature: `${name}(@value)`,
+    description: `Applies the ${name.toLowerCase()} mathematical function.`,
+  };
+}
+Object.assign(functionHelp, {
+  POW: { signature: 'POW(@value, exponent)', description: 'Raises a number to an exponent.' },
+  SUBSTR: { signature: 'SUBSTR(@text, start, length)', description: 'Returns part of a text value.' },
+  REPLACE: { signature: 'REPLACE(@text, "old", "new")', description: 'Replaces matching text.' },
+  LOWER: { signature: 'LOWER(@text)', description: 'Converts text to lowercase.' },
+  UPPER: { signature: 'UPPER(@text)', description: 'Converts text to uppercase.' },
+  TRIM: { signature: 'TRIM(@text)', description: 'Removes surrounding whitespace.' },
+  CONCAT: { signature: 'CONCAT(value, value)', description: 'Joins text values.' },
+  LEN: { signature: 'LEN(@text)', description: 'Returns the number of characters.' },
+});
+
+function expressionTokens(expression: string) {
+  return expression.match(/"(?:\\.|[^"\\])*"|@[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?|>=|<=|==|!=|\bAND\b|\bOR\b|[A-Za-z_][A-Za-z0-9_]*|-?\d+(?:\.\d+)?|[(),+*/<>-]/gi) || [];
+}
+
+function formatExpression(expression: string) {
+  const tokens = expressionTokens(expression.trim());
+  if (!tokens.length) return expression.trim();
+  let output = '';
+  let depth = 0;
+  const functionStack: boolean[] = [];
+  const indent = () => '  '.repeat(depth);
+  const newline = () => {
+    output = `${output.trimEnd()}\n${indent()}`;
+  };
+  const word = (token: string) => /^[@A-Za-z0-9_".-]/.test(token);
+  tokens.forEach((token, index) => {
+    const previous = tokens[index - 1] || '';
+    if (token === '(') {
+      const isFunction = /^[A-Za-z_][A-Za-z0-9_]*$/.test(previous);
+      output = output.trimEnd() + '(';
+      functionStack.push(isFunction);
+      depth++;
+      if (isFunction) newline();
+    } else if (token === ')') {
+      const wasFunction = functionStack.pop() || false;
+      depth = Math.max(0, depth - 1);
+      if (wasFunction) newline();
+      output = output.trimEnd() + ')';
+    } else if (token === ',') {
+      output = output.trimEnd() + ',';
+      if (functionStack[functionStack.length - 1]) newline();
+      else output += ' ';
+    } else if (/^(AND|OR)$/i.test(token)) {
+      newline();
+      output += `${token.toUpperCase()} `;
+    } else if (/^(==|!=|>=|<=|>|<|\+|-|\*|\/)$/i.test(token)) {
+      output = `${output.trimEnd()} ${token} `;
+    } else {
+      if (output && !/[\s(]$/.test(output) && word(token) && word(previous)) output += ' ';
+      output += token;
+    }
+  });
+  return output.trim();
+}
+
+function splitExpressionArguments(value: string) {
+  const parts: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quoted = false;
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index];
+    if (character === '"' && value[index - 1] !== '\\') quoted = !quoted;
+    if (quoted) continue;
+    if (character === '(') depth++;
+    else if (character === ')') depth--;
+    else if (character === ',' && depth === 0) {
+      parts.push(value.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  parts.push(value.slice(start).trim());
+  return parts;
+}
+
+function outerExpressionCall(value: string) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+  if (!match || !trimmed.endsWith(')')) return undefined;
+  return { name: match[1].toUpperCase(), args: splitExpressionArguments(trimmed.slice(match[0].length, -1)) };
+}
+
+function readableExpressionValue(value: string): string {
+  const call = outerExpressionCall(value);
+  if (call?.name === 'IF' && call.args.length === 3)
+    return `If ${readableCondition(call.args[0])}, then ${readableExpressionValue(call.args[1])}; otherwise ${readableExpressionValue(call.args[2])}`;
+  if ((call?.name === 'LOOKUP_ONE' || call?.name === 'LOOKUP_FIRST') && call.args.length === 3) {
+    const mode = call.name === 'LOOKUP_ONE' ? 'the single matching row' : 'the first matching row';
+    return `return ${readableReference(call.args[2])} from ${mode} in ${readableReference(call.args[0])} where ${readableCondition(call.args[1])}`;
+  }
+  if (call && call.args.length)
+    return `${call.name.toLowerCase()} of ${call.args.map(readableExpressionValue).join(', ')}`;
+  return readableCondition(value);
+}
+
+function readableReference(value: string) {
+  return value.trim().replace(/^@/, '').replace('.', ' → ').replaceAll('_', ' ');
+}
+
+function readableCondition(value: string) {
+  return value
+    .trim()
+    .replace(/@([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?/g, (_, sample, column) =>
+      column ? `${sample.replaceAll('_', ' ')} → ${column.replaceAll('_', ' ')}` : sample.replaceAll('_', ' '),
+    )
+    .replace(/\s*==\s*/g, ' equals ')
+    .replace(/\s*!=\s*/g, ' does not equal ')
+    .replace(/\s*>=\s*/g, ' is at least ')
+    .replace(/\s*<=\s*/g, ' is at most ')
+    .replace(/\s*>\s*/g, ' is greater than ')
+    .replace(/\s*<\s*/g, ' is less than ')
+    .replace(/\bAND\b/gi, 'and')
+    .replace(/\bOR\b/gi, 'or');
+}
+
+function expressionItemDescription(label: string, template: string) {
+  const functionName = template.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/)?.[1]?.toUpperCase();
+  if (functionName && functionHelp[functionName]) return functionHelp[functionName].description;
+  const descriptions: Record<string, string> = {
+    Add: 'Adds two numerical values.',
+    Subtract: 'Subtracts the right value from the left value.',
+    Multiply: 'Multiplies two numerical values.',
+    Divide: 'Divides the left value by the right value.',
+    Equal: 'Checks whether two values are equal.',
+    'Not equal': 'Checks whether two values are different.',
+    'Greater than': 'Checks whether the left number is greater.',
+    'Less than': 'Checks whether the left number is smaller.',
+    AND: 'Requires both boolean conditions to be true.',
+    OR: 'Requires at least one boolean condition to be true.',
+  };
+  return descriptions[label] || '';
+}
 const expressionGroups = [
   {
     name: 'Operators',
@@ -396,7 +828,10 @@ const expressionGroups = [
   },
   {
     name: 'Conditional statements',
-    items: [['IF', 'IF(@boolean_parameter, result_if_true, result_if_false)']],
+    items: [
+      ['IF', 'IF(@boolean_parameter, result_if_true, result_if_false)'],
+      ['Is null', 'IS_NULL(@value)'],
+    ],
   },
   {
     name: 'Aggregate functions',
@@ -433,9 +868,10 @@ const expressionGroups = [
       ['First row', 'FIRST(@sample.column)'],
       ['Specific row', 'NTH(@sample.column, 2)'],
       ['Last row', 'LAST(@sample.column)'],
-      ['Column contains', 'CONTAINS(@sample.column, "value")'],
-      ['Lookup exactly one', 'LOOKUP_ONE(@sample, column == @value, return_column)'],
-      ['Lookup first', 'LOOKUP_FIRST(@sample, column == @value, return_column)'],
+      ['Column has exact value', 'CONTAINS(@sample.column, "value")'],
+      ['Column matches regex', 'MATCHES(@sample.column, "^value.*")'],
+      ['Lookup exactly one', 'LOOKUP_ONE(@sample, @sample.column == @value, @sample.return_column)'],
+      ['Lookup first', 'LOOKUP_FIRST(@sample, @sample.column == @value, @sample.return_column)'],
     ],
   },
   {
@@ -465,9 +901,11 @@ function ExpressionPopupEditor({
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [category, setCategory] = useState<string>(expressionGroups[0].name);
   const begin = () => {
     setDraft(value);
+    setPreviewOpen(false);
     setOpen(true);
   };
   const insert = (template: string) => {
@@ -487,6 +925,7 @@ function ExpressionPopupEditor({
     });
   };
   const group = expressionGroups.find((item) => item.name === category) || expressionGroups[0];
+  const explanation = draft.trim() ? readableExpressionValue(draft) : '';
   return (
     <>
       <div className="expression-field">
@@ -542,11 +981,31 @@ function ExpressionPopupEditor({
                     <button type="button" key={label} onClick={() => insert(template)}>
                       <strong>{label}</strong>
                       <code>{template}</code>
+                      <span>{expressionItemDescription(label, template)}</span>
                     </button>
                   ))}
                 </div>
                 <div className="expression-workspace">
-                  <label>Expression</label>
+                  <div className="expression-workspace-heading">
+                    <label>Expression</label>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => {
+                        const formatted = formatExpression(draft);
+                        setDraft(formatted);
+                        requestAnimationFrame(() => {
+                          const editor = document.querySelector<HTMLTextAreaElement>(
+                            '.expression-editor-dialog textarea',
+                          );
+                          editor?.focus();
+                          editor?.setSelectionRange(formatted.length, formatted.length);
+                        });
+                      }}
+                    >
+                      Format expression
+                    </button>
+                  </div>
                   <ExpressionAutocomplete
                     multiline
                     value={draft}
@@ -555,6 +1014,26 @@ function ExpressionPopupEditor({
                     placeholder={placeholder}
                   />
                   <small>References begin with @. Function names do not.</small>
+                  <div className={`expression-readable-preview ${previewOpen ? 'expanded' : ''}`}>
+                    <button
+                      type="button"
+                      className="expression-preview-toggle"
+                      aria-expanded={previewOpen}
+                      onClick={() => setPreviewOpen((current) => !current)}
+                    >
+                      <span>
+                        <strong>Plain-language preview</strong>
+                        <small>Readable explanation of the current expression</small>
+                      </span>
+                      <ChevronDown />
+                    </button>
+                    {previewOpen && (
+                      <div className="expression-preview-body">
+                        <p>{explanation || 'Enter an expression to see a readable explanation.'}</p>
+                        <small>This preview is explanatory; the expression above is executed.</small>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </main>
             </div>
@@ -602,19 +1081,72 @@ export default function ModelEditor({
   const [pendingOutput, setPendingOutput] = useState('');
   const [addingOutput, setAddingOutput] = useState(false);
   const [pendingIndex, setPendingIndex] = useState<{ name: string; values: string[] }>();
+  const [usageView, setUsageView] = useState<{ name: string; usages: ParameterUsage[] }>();
+  const [renameView, setRenameView] = useState<{
+    index: number;
+    oldName: string;
+    newName: string;
+    usages: ParameterUsage[];
+  }>();
+  const [refactorBusy, setRefactorBusy] = useState(false);
+  const [refactorError, setRefactorError] = useState('');
+  const requestRefactor = async (action: 'find' | 'rename', oldName: string, newName = '') => {
+    const response = await fetch(appPath('/api/parameters/refactor'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, oldName, newName, model: refactorModel(form) }),
+    });
+    const text = await response.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`Parameter refactor returned HTTP ${response.status} with an invalid response.`);
+    }
+    if (!response.ok) throw new Error(data.error || `Parameter refactor failed with HTTP ${response.status}.`);
+    return data as { usages: ParameterUsage[]; model?: any };
+  };
+  const findUsages = async (parameter: Parameter, index: number, rename = false) => {
+    setRefactorBusy(true);
+    setRefactorError('');
+    try {
+      const result = await requestRefactor('find', parameter.key);
+      if (rename) {
+        setRenameView({ index, oldName: parameter.key, newName: parameter.key, usages: result.usages || [] });
+      } else {
+        setUsageView({ name: parameter.key, usages: result.usages || [] });
+      }
+    } catch (reason) {
+      setRefactorError((reason as Error).message);
+    } finally {
+      setRefactorBusy(false);
+    }
+  };
+  const openUsage = (usage: ParameterUsage) => {
+    setUsageView(undefined);
+    if (usage.section === 'parameter' && usage.parameterIndex !== undefined) {
+      setExpandedParameter(usage.parameterIndex);
+    }
+    if (usage.section === 'data-sample') {
+      const index = form.dataSamples.findIndex((sample: DataSample) => sample.key === usage.location);
+      if (index >= 0) setExpandedSample(index);
+    }
+    const target =
+      usage.section === 'parameter' && usage.parameterIndex !== undefined
+        ? `parameter-refactor-${usage.parameterIndex}`
+        : usage.section === 'data-sample'
+          ? `data-sample-refactor-${form.dataSamples.findIndex((sample: DataSample) => sample.key === usage.location)}`
+          : usage.section === 'outputs'
+            ? 'model-outputs-refactor'
+            : 'model-partition-refactor';
+    window.setTimeout(() => document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0);
+  };
   const externalContext = Object.fromEntries(
     form.externalInputs.map((input: ExternalInput) => [
       input.name || 'external_input',
       input.type === 'number' ? 0 : input.type === 'boolean' ? false : 'VALUE',
     ]),
-  );
-  const parameterValues = Object.fromEntries(
-    form.parameters
-      .filter((p: Parameter) => p.source === 'sql')
-      .map((p: Parameter) => [
-        p.key,
-        (p.dataType || 'number') === 'number' ? 0 : p.dataType === 'boolean' ? false : 'VALUE',
-      ]),
   );
   const adaptiveFeedbackNames = new Set<string>(
     form.parameters
@@ -627,18 +1159,13 @@ export default function ModelEditor({
   );
   const payload = JSON.stringify(
     {
-      runId: 'RUN_UNIQUE_ID',
-      context: {
-        lotId: 'LOT_ID',
-        ...Object.fromEntries(
-          Object.entries(form.indexes).map(([key, values]) => [
-            key,
-            (values as string[])[0] || 'VALUE',
-          ]),
-        ),
-        ...externalContext,
-      },
-      parameterValues,
+      indexes: Object.fromEntries(
+        Object.entries(form.indexes).map(([key, values]) => [
+          key,
+          (values as string[])[0] === '*' ? 'VALUE' : (values as string[])[0] || 'VALUE',
+        ]),
+      ),
+      externalInputs: externalContext,
     },
     null,
     2,
@@ -654,7 +1181,7 @@ export default function ModelEditor({
     indexes: Object.entries(form.indexes).map(([name, values]) => ({
       name,
       type: 'string',
-      required: true,
+      required: ['machine', 'action', 'material'].includes(name.toLowerCase()),
       acceptedValues: values,
     })),
     externalInputs: form.externalInputs.map((input: ExternalInput) => ({
@@ -663,14 +1190,6 @@ export default function ModelEditor({
       required: true,
       description: input.description || '',
     })),
-    optionalParameterOverrides: form.parameters
-      .filter((parameter: Parameter) => parameter.source === 'sql')
-      .map((parameter: Parameter) => ({
-        name: parameter.key,
-        type: parameter.dataType || 'number',
-        required: false,
-        description: parameter.description || '',
-      })),
     outputs: form.outputs.map((name: string) => ({
       name,
       type: parameterDefinitions.get(name)?.dataType || 'number',
@@ -719,8 +1238,8 @@ export default function ModelEditor({
                   : 'Create model revision'}
             </h3>
             <p>
-              Declare tabular data first, then parameters, then select which parameters the model
-              returns.
+              Configure the model inputs and optional data samples, define how each parameter is
+              resolved, then choose which parameters are returned as outputs.
             </p>
           </div>
           <div className="editor-title-actions">
@@ -777,22 +1296,24 @@ export default function ModelEditor({
           <div className="parameter-empty">No data samples defined.</div>
         )}
         {form.dataSamples.map((sample: DataSample, index: number) => (
-          <DataSampleCard
-            key={index}
-            sample={sample}
-            parameters={form.parameters}
-            externalInputs={form.externalInputs}
-            expanded={expandedSample === index}
-            onToggle={() => setExpandedSample(expandedSample === index ? null : index)}
-            onChange={(next: DataSample) => updateSample(form, setForm, index, next)}
-            onRemove={() => {
-              setForm({
-                ...form,
-                dataSamples: form.dataSamples.filter((_: unknown, n: number) => n !== index),
-              });
-              setExpandedSample(null);
-            }}
-          />
+          <div id={`data-sample-refactor-${index}`} key={index}>
+            <DataSampleCard
+              sample={sample}
+              parameters={form.parameters}
+              externalInputs={form.externalInputs}
+              indexes={form.indexes}
+              expanded={expandedSample === index}
+              onToggle={() => setExpandedSample(expandedSample === index ? null : index)}
+              onChange={(next: DataSample) => updateSample(form, setForm, index, next)}
+              onRemove={() => {
+                setForm({
+                  ...form,
+                  dataSamples: form.dataSamples.filter((_: unknown, n: number) => n !== index),
+                });
+                setExpandedSample(null);
+              }}
+            />
+          </div>
         ))}
         <ExternalInputsEditor
           inputs={form.externalInputs}
@@ -816,28 +1337,34 @@ export default function ModelEditor({
           <div className="parameter-empty">No parameters defined.</div>
         )}
         {form.parameters.map((parameter: Parameter, index: number) => (
-          <ParameterCard
-            key={index}
-            parameter={parameter}
-            previous={form.parameters.slice(0, index)}
-            allParameters={form.parameters.filter((_: Parameter, n: number) => n !== index)}
-            samples={form.dataSamples}
-            externalInputs={form.externalInputs}
-            feedbackInputs={form.feedbackInputs || []}
-            indexes={form.indexes}
-            expanded={expandedParameter === index}
-            onToggle={() => setExpandedParameter(expandedParameter === index ? null : index)}
-            onChange={(next: Parameter) => updateInput(index, next)}
-            onRemove={() => {
-              setForm({
-                ...form,
-                parameters: form.parameters.filter((_: unknown, n: number) => n !== index),
-                outputs: form.outputs.filter((key: string) => key !== parameter.key),
-              });
-              setExpandedParameter(null);
-            }}
-          />
+          <div id={`parameter-refactor-${index}`} key={index}>
+            <ParameterCard
+              parameter={parameter}
+              previous={form.parameters.slice(0, index)}
+              allParameters={form.parameters.filter((_: Parameter, n: number) => n !== index)}
+              samples={form.dataSamples}
+              externalInputs={form.externalInputs}
+              feedbackInputs={form.feedbackInputs || []}
+              indexes={form.indexes}
+              expanded={expandedParameter === index}
+              onToggle={() => setExpandedParameter(expandedParameter === index ? null : index)}
+              onChange={(next: Parameter) => updateInput(index, next)}
+              onFindUsages={() => findUsages(parameter, index)}
+              onRename={() => findUsages(parameter, index, true)}
+              refactorBusy={refactorBusy}
+              onRemove={() => {
+                setForm({
+                  ...form,
+                  parameters: form.parameters.filter((_: unknown, n: number) => n !== index),
+                  outputs: form.outputs.filter((key: string) => key !== parameter.key),
+                });
+                setExpandedParameter(null);
+              }}
+            />
+          </div>
         ))}
+        {refactorError && <p className="error">{refactorError}</p>}
+        <div id="model-outputs-refactor" />
         <EditorHeader
           title="Model outputs"
           action={
@@ -918,16 +1445,33 @@ export default function ModelEditor({
         />
         <EditorHeader title="Execution policy" />
         <p className="field-help">
-          Limit prepared runs within each selected partition. A run stops counting only after a
-          valid completion request is accepted.
+          Unfinished runs are unlimited by default. Enable a limit when overlapping prepared runs
+          must be controlled within each selected partition.
         </p>
         <div className="execution-policy">
+          <label className="execution-limit-toggle">
+            <input
+              type="checkbox"
+              checked={(form.executionPolicy?.maxUnfinishedRuns || 0) > 0}
+              onChange={(event) =>
+                setForm({
+                  ...form,
+                  executionPolicy: {
+                    ...form.executionPolicy,
+                    maxUnfinishedRuns: event.target.checked ? 1 : 0,
+                  },
+                })
+              }
+            />
+            Limit unfinished runs
+          </label>
           <label>
             Maximum unfinished runs
             <input
               type="number"
               min="1"
               step="1"
+              disabled={(form.executionPolicy?.maxUnfinishedRuns || 0) === 0}
               value={form.executionPolicy?.maxUnfinishedRuns || 1}
               onChange={(event) =>
                 setForm({
@@ -940,9 +1484,12 @@ export default function ModelEditor({
               }
             />
           </label>
-          <fieldset className="execution-partition">
+          <fieldset className="execution-partition" id="model-partition-refactor">
             <legend>Run and adaptive-state partition</legend>
-            <p>Each value combination receives an independent run limit and adaptive state.</p>
+            <p>
+              Each value combination receives an independent run limit and adaptive state. If no
+              fields are selected, the partition defaults to machine.
+            </p>
             <div>
               {[
                 ...Object.keys(form.indexes),
@@ -962,7 +1509,7 @@ export default function ModelEditor({
                             ...form,
                             executionPolicy: {
                               ...form.executionPolicy,
-                              maxUnfinishedRuns: form.executionPolicy?.maxUnfinishedRuns || 1,
+                              maxUnfinishedRuns: form.executionPolicy?.maxUnfinishedRuns || 0,
                               partitionBy: selected.includes(field)
                                 ? selected.filter((item: string) => item !== field)
                                 : [...selected, field],
@@ -985,7 +1532,10 @@ export default function ModelEditor({
             </p>
           )}
         <label>
-          Change note
+          <span className="field-label">
+            <span>Change note</span>
+            <b className="required-badge">Required</b>
+          </span>
           <textarea
             value={form.note}
             onChange={(e) => setForm({ ...form, note: e.target.value })}
@@ -1011,7 +1561,10 @@ export default function ModelEditor({
           <AddDialog title="Add index" onClose={() => setPendingIndex(undefined)}>
             <div className="form-grid">
               <label>
-                Index name
+                <span className="field-label">
+                  <span>Index name</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <select
                   value={pendingIndex.name}
                   onChange={(event) =>
@@ -1035,7 +1588,10 @@ export default function ModelEditor({
                 </select>
               </label>
               <label>
-                Accepted values
+                <span className="field-label">
+                  <span>Accepted values</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <IndexValuesInput
                   values={pendingIndex.values}
                   onChange={(values) => setPendingIndex({ ...pendingIndex, values })}
@@ -1064,7 +1620,10 @@ export default function ModelEditor({
           <AddDialog title="Add external input" onClose={() => setPendingExternal(undefined)}>
             <div className="form-grid three">
               <label>
-                Name
+                <span className="field-label">
+                  <span>Name</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <select
                   value={pendingExternal.name}
                   onChange={(event) => {
@@ -1097,7 +1656,10 @@ export default function ModelEditor({
                 </select>
               </label>
               <label>
-                Data type
+                <span className="field-label">
+                  <span>Data type</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <select
                   disabled
                   value={pendingExternal.type}
@@ -1114,7 +1676,7 @@ export default function ModelEditor({
                 </select>
               </label>
               <label>
-                Description
+                Description (optional)
                 <input
                   disabled
                   value={pendingExternal.description || ''}
@@ -1142,7 +1704,10 @@ export default function ModelEditor({
           <AddDialog title="Add post-run feedback" onClose={() => setPendingFeedback(undefined)}>
             <div className="form-grid three">
               <label>
-                Name
+                <span className="field-label">
+                  <span>Name</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <input
                   value={pendingFeedback.name}
                   onChange={(event) =>
@@ -1151,7 +1716,10 @@ export default function ModelEditor({
                 />
               </label>
               <label>
-                Data type
+                <span className="field-label">
+                  <span>Data type</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <select
                   value={pendingFeedback.type}
                   onChange={(event) =>
@@ -1166,7 +1734,7 @@ export default function ModelEditor({
                 </select>
               </label>
               <label>
-                Description
+                Description (optional)
                 <input
                   value={pendingFeedback.description || ''}
                   onChange={(event) =>
@@ -1202,7 +1770,10 @@ export default function ModelEditor({
         {addingOutput && (
           <AddDialog title="Add model output" onClose={() => setAddingOutput(false)}>
             <label>
-              Parameter
+              <span className="field-label">
+                <span>Parameter</span>
+                <b className="required-badge">Required</b>
+              </span>
               <select
                 value={pendingOutput}
                 onChange={(event) => setPendingOutput(event.target.value)}
@@ -1292,6 +1863,7 @@ export default function ModelEditor({
                   sample={pendingSample}
                   parameters={form.parameters}
                   externalInputs={form.externalInputs}
+                  indexes={form.indexes}
                   expanded
                   onToggle={() => undefined}
                   onChange={setPendingSample}
@@ -1308,9 +1880,12 @@ export default function ModelEditor({
                       (pendingSample.source === 'sql' &&
                         (!pendingSample.dataSourceId ||
                           !pendingSample.query.trim() ||
-                          !pendingSample.columns?.length)) ||
+                          !pendingSample.columns?.length ||
+                          pendingSample.columns.some((column) => !column.name.trim()))) ||
                       (pendingSample.source === 'static' &&
-                        (!pendingSample.columns?.length || !pendingSample.rows?.length)) ||
+                        (!pendingSample.columns?.length ||
+                          pendingSample.columns.some((column) => !column.name.trim()) ||
+                          !pendingSample.rows?.length)) ||
                       pendingSample.limit < 1
                     }
                     onClick={() => {
@@ -1324,6 +1899,89 @@ export default function ModelEditor({
               </div>
             </section>
           </div>
+        )}
+        {usageView && (
+          <AddDialog title={`Uses of ${usageView.name}`} onClose={() => setUsageView(undefined)}>
+            {usageView.usages.length ? (
+              <div className="parameter-usage-list">
+                {usageView.usages.map((usage, index) => (
+                  <button type="button" key={`${usage.section}-${usage.location}-${index}`} onClick={() => openUsage(usage)}>
+                    <strong>{usage.location}</strong>
+                    <span>{usage.detail}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="parameter-empty">No references found.</div>
+            )}
+            <div className="add-definition-actions">
+              <button className="primary" onClick={() => setUsageView(undefined)}>Close</button>
+            </div>
+          </AddDialog>
+        )}
+        {renameView && (
+          <AddDialog title="Rename parameter" onClose={() => !refactorBusy && setRenameView(undefined)}>
+            <p className="refactor-rename-heading">
+              Rename: <code>{renameView.oldName}</code> → <code>{renameView.newName || 'new_name'}</code>
+            </p>
+            <label>
+              <span className="field-label">
+                New parameter name <b className="required-badge">Required</b>
+              </span>
+              <input
+                autoFocus
+                value={renameView.newName}
+                onChange={(event) => {
+                  setRefactorError('');
+                  setRenameView({ ...renameView, newName: event.target.value.trim() });
+                }}
+              />
+            </label>
+            <p className="refactor-dialog-intro">References that will be updated:</p>
+            {renameView.usages.length ? (
+              <div className="parameter-usage-list compact">
+                {renameView.usages.map((usage, index) => (
+                  <div key={`${usage.section}-${usage.location}-${index}`}>
+                    <strong>{usage.location}</strong>
+                    <span>{usage.detail}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="parameter-empty">No references need to be updated.</div>
+            )}
+            {refactorError && <p className="error">{refactorError}</p>}
+            <DialogActions
+              label={refactorBusy ? 'Validating rename…' : `Rename and update ${renameView.usages.length} reference${renameView.usages.length === 1 ? '' : 's'}`}
+              disabled={
+                refactorBusy ||
+                renameView.newName === renameView.oldName ||
+                !/^[A-Za-z_][A-Za-z0-9_]*$/.test(renameView.newName)
+              }
+              onCancel={() => setRenameView(undefined)}
+              onSave={async () => {
+                setRefactorBusy(true);
+                setRefactorError('');
+                try {
+                  const result = await requestRefactor('rename', renameView.oldName, renameView.newName);
+                  if (!result.model) throw new Error('The backend did not return the renamed model.');
+                  setForm({
+                    ...form,
+                    parameters: result.model.parameters,
+                    dataSamples: result.model.dataSamples,
+                    outputs: result.model.outputs,
+                    executionPolicy: result.model.executionPolicy,
+                  });
+                  setExpandedParameter(renameView.index);
+                  setRenameView(undefined);
+                } catch (reason) {
+                  setRefactorError((reason as Error).message);
+                } finally {
+                  setRefactorBusy(false);
+                }
+              }}
+            />
+          </AddDialog>
         )}
         {showPayload && (
           <div
@@ -1465,7 +2123,7 @@ export function DependencyDialog({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/dependencies', {
+    fetch(appPath('/api/dependencies'), {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
@@ -1660,7 +2318,11 @@ function DependencyGraphView({ graph, outputs }: { graph: DependencyGraph; outpu
               const position = layout.node(node.id);
               const source =
                 node.kind === 'sample'
-                  ? 'SQL data sample'
+                  ? node.properties.some(
+                      (property) => property.label === 'Source' && property.value === 'static',
+                    )
+                    ? 'Static data sample'
+                    : 'SQL data sample'
                   : node.kind === 'external'
                     ? 'External app'
                     : node.kind === 'feedback'
@@ -1968,7 +2630,16 @@ function StaticDataSampleEditor({
   const columns = sample.columns || [];
   const rows = sample.rows || [];
   const defaultValue = (type: DataSampleColumn['type']) =>
-    type === 'number' ? 0 : type === 'boolean' ? false : '';
+    type === 'boolean' ? false : null;
+  const columnInputWidth = (columnName: string) =>
+    `${Math.min(
+      48,
+      Math.max(
+        12,
+        ...rows.map((row) => String(row[columnName] === null ? 'NULL' : row[columnName] ?? '').length + 3),
+      ),
+    )}ch`;
+
   const updateColumns = (nextColumns: DataSampleColumn[], nextRows = rows) =>
     onChange({ ...sample, columns: nextColumns, rows: nextRows });
   return (
@@ -2091,32 +2762,7 @@ function StaticDataSampleEditor({
                     <td key={column.name}>
                       {column.type === 'boolean' ? (
                         <select
-                          value={String(row[column.name] ?? false)}
-                          onChange={(event) =>
-                            onChange({
-                              ...sample,
-                              rows: rows.map((item, index) =>
-                                index === rowIndex
-                                  ? { ...item, [column.name]: event.target.value === 'true' }
-                                  : item,
-                              ),
-                            })
-                          }
-                        >
-                          <option value="false">False</option>
-                          <option value="true">True</option>
-                        </select>
-                      ) : (
-                        <input
-                          type={column.type === 'number' ? 'number' : 'text'}
-                          step={column.type === 'number' ? 'any' : undefined}
-                          value={String(row[column.name] ?? '')}
-                          style={{
-                            width: `${Math.min(
-                              48,
-                              Math.max(12, String(row[column.name] ?? '').length + 3),
-                            )}ch`,
-                          }}
+                          value={row[column.name] === null ? 'null' : String(row[column.name] ?? false)}
                           onChange={(event) =>
                             onChange({
                               ...sample,
@@ -2124,25 +2770,105 @@ function StaticDataSampleEditor({
                                 index === rowIndex
                                   ? {
                                       ...item,
-                                      [column.name]: event.target.value,
+                                      [column.name]:
+                                        event.target.value === 'null'
+                                          ? null
+                                          : event.target.value === 'true',
                                     }
                                   : item,
                               ),
                             })
                           }
-                          onBlur={(event) => {
-                            if (column.type !== 'number' || event.target.value.trim() === '')
-                              return;
-                            const number = Number(event.target.value);
-                            if (!Number.isFinite(number)) return;
-                            onChange({
-                              ...sample,
-                              rows: rows.map((item, index) =>
-                                index === rowIndex ? { ...item, [column.name]: number } : item,
-                              ),
-                            });
-                          }}
-                        />
+                        >
+                          <option value="false">False</option>
+                          <option value="true">True</option>
+                          <option value="null">NULL</option>
+                        </select>
+                      ) : (
+                        <div className="static-sample-cell">
+                          {row[column.name] === null ? (
+                            <input
+                              type={column.type === 'number' ? 'number' : 'text'}
+                              className="static-null-value"
+                              value=""
+                              placeholder="NULL"
+                              aria-label={`${column.name} NULL value`}
+                              style={{ width: columnInputWidth(column.name) }}
+                              onFocus={() =>
+                                onChange({
+                                  ...sample,
+                                  rows: rows.map((item, index) =>
+                                    index === rowIndex
+                                      ? { ...item, [column.name]: '' }
+                                     : item,
+                                  ),
+                                })
+                              }
+                            />
+                          ) : (
+                            <>
+                              <input
+                                type={column.type === 'number' ? 'number' : 'text'}
+                                step={column.type === 'number' ? 'any' : undefined}
+                                value={String(row[column.name] ?? '')}
+                            style={{
+                              width: columnInputWidth(column.name),
+                            }}
+                                onChange={(event) =>
+                                  onChange({
+                                    ...sample,
+                                    rows: rows.map((item, index) =>
+                                      index === rowIndex
+                                        ? { ...item, [column.name]: event.target.value }
+                                        : item,
+                                    ),
+                                  })
+                                }
+                                onBlur={(event) => {
+                                  const entered = event.target.value.trim();
+                                  if (entered === '') {
+                                    onChange({
+                                      ...sample,
+                                      rows: rows.map((item, index) =>
+                                        index === rowIndex
+                                          ? { ...item, [column.name]: null }
+                                          : item,
+                                      ),
+                                    });
+                                    return;
+                                  }
+                                  if (column.type !== 'number') return;
+                                  const number = Number(entered);
+                                  if (!Number.isFinite(number)) return;
+                                  onChange({
+                                    ...sample,
+                                    rows: rows.map((item, index) =>
+                                      index === rowIndex
+                                        ? { ...item, [column.name]: number }
+                                        : item,
+                                    ),
+                                  });
+                                }}
+                              />
+                              <button
+                                type="button"
+                                className="static-set-null"
+                                onClick={() =>
+                                  onChange({
+                                    ...sample,
+                                    rows: rows.map((item, index) =>
+                                      index === rowIndex
+                                        ? { ...item, [column.name]: null }
+                                        : item,
+                                    ),
+                                  })
+                                }
+                              >
+                                Set NULL
+                              </button>
+                            </>
+                          )}
+                        </div>
                       )}
                     </td>
                   ))}
@@ -2181,7 +2907,10 @@ function SQLSampleSchemaEditor({
     <div className="sql-sample-schema span-three">
       <div className="adaptive-heading">
         <div>
-          <strong>Expected result columns</strong>
+          <span className="field-label">
+            <strong>Expected result columns</strong>
+            <b className="required-badge">Required</b>
+          </span>
           <small>Returned SQL rows are validated against this typed contract.</small>
         </div>
         <button
@@ -2190,7 +2919,7 @@ function SQLSampleSchemaEditor({
           onClick={() =>
             onChange({
               ...sample,
-              columns: [...columns, { name: `column_${columns.length + 1}`, type: 'string' }],
+              columns: [...columns, { name: '', type: 'string' }],
             })
           }
         >
@@ -2200,7 +2929,7 @@ function SQLSampleSchemaEditor({
       </div>
       {columns.length === 0 ? (
         <div className="parameter-empty">
-          No schema declared. Add every column used by parameters or lookup operations.
+          No schema declared. Add each SQL result column that an expression or lookup will use.
         </div>
       ) : (
         <div className="sql-sample-column-list">
@@ -2262,6 +2991,7 @@ function DataSampleCard({
   sample,
   parameters,
   externalInputs,
+  indexes,
   expanded,
   onToggle,
   onChange,
@@ -2270,6 +3000,7 @@ function DataSampleCard({
   sample: DataSample;
   parameters: Parameter[];
   externalInputs: ExternalInput[];
+  indexes: Record<string, string[]>;
   expanded: boolean;
   onToggle: () => void;
   onChange: (next: DataSample) => void;
@@ -2299,7 +3030,10 @@ function DataSampleCard({
         <div className="accordion-body">
           <div className="form-grid three">
             <label>
-              Key
+              <span className="field-label">
+                <span>Key</span>
+                <b className="required-badge">Required</b>
+              </span>
               <input
                 value={sample.key}
                 onChange={(e) => onChange({ ...sample, key: e.target.value })}
@@ -2307,7 +3041,10 @@ function DataSampleCard({
               />
             </label>
             <label>
-              Source type
+              <span className="field-label">
+                <span>Source type</span>
+                <b className="required-badge">Required</b>
+              </span>
               <select
                 value={sample.source}
                 onChange={(event) => {
@@ -2333,7 +3070,10 @@ function DataSampleCard({
               </select>
             </label>
             <label>
-              Record limit
+              <span className="field-label">
+                <span>Record limit</span>
+                <b className="required-badge">Required</b>
+              </span>
               <input
                 type="number"
                 min="1"
@@ -2351,7 +3091,10 @@ function DataSampleCard({
             {sample.source === 'sql' ? (
               <>
                 <label>
-                  Data source
+                  <span className="field-label">
+                    <span>Data source</span>
+                    <b className="required-badge">Required</b>
+                  </span>
                   <select
                     value={sample.dataSourceId || ''}
                     onChange={(e) => onChange({ ...sample, dataSourceId: e.target.value })}
@@ -2367,7 +3110,10 @@ function DataSampleCard({
                   </select>
                 </label>
                 <label className="span-three">
-                  SQL query
+                  <span className="field-label">
+                    <span>SQL query</span>
+                    <b className="required-badge">Required</b>
+                  </span>
                   <SQLAutocomplete
                     value={sample.query}
                     onChange={(query) => onChange({ ...sample, query })}
@@ -2377,13 +3123,20 @@ function DataSampleCard({
                         .map((input) => ({
                           name: input.name,
                           source: 'External input' as const,
+                          dataType: input.type,
                         })),
                       ...parameters
                         .filter((parameter) => parameter.key)
                         .map((parameter) => ({
                           name: parameter.key,
                           source: 'Parameter' as const,
+                          dataType: parameter.dataType || ('number' as const),
                         })),
+                      ...Object.keys(indexes).map((name) => ({
+                        name,
+                        source: 'Model index',
+                        dataType: 'string' as const,
+                      })),
                     ]}
                     placeholder="SELECT TOP (10) thickness_nm FROM process_history WHERE wafer_id = @wafer_id"
                   />
@@ -2429,6 +3182,22 @@ function DataSampleCard({
                   </div>
                 )}
                 <SQLSampleSchemaEditor sample={sample} onChange={onChange} />
+                <SQLQueryTester
+                  dataSourceId={sample.dataSourceId}
+                  query={sample.query}
+                  queryType="data_sample"
+                  columns={sample.columns}
+                  limit={sample.limit}
+                  references={[
+                    ...externalInputs
+                      .filter((input) => input.name)
+                      .map((input) => ({ name: input.name, source: 'External input', dataType: input.type })),
+                    ...parameters
+                      .filter((parameter) => parameter.key)
+                      .map((parameter) => ({ name: parameter.key, source: 'Parameter', dataType: parameter.dataType || ('number' as const) })),
+                    ...Object.keys(indexes).map((name) => ({ name, source: 'Model index', dataType: 'string' as const })),
+                  ]}
+                />
               </>
             ) : (
               <StaticDataSampleEditor sample={sample} onChange={onChange} />
@@ -2453,6 +3222,9 @@ function ParameterCard({
   onSave,
   onChange,
   onRemove,
+  onFindUsages,
+  onRename,
+  refactorBusy,
 }: {
   parameter: Parameter;
   previous: Parameter[];
@@ -2466,6 +3238,9 @@ function ParameterCard({
   onSave?: () => void;
   onChange: (next: Parameter) => void;
   onRemove: () => void;
+  onFindUsages?: () => void;
+  onRename?: () => void;
+  refactorBusy?: boolean;
 }) {
   const sourceName = parameter.adaptive
     ? 'Adaptive'
@@ -2499,9 +3274,21 @@ function ParameterCard({
             </small>
           </span>
         </button>
-        <button className="remove-index" title="Remove parameter" onClick={onRemove}>
-          <Trash2 />
-        </button>
+        <div className="parameter-card-actions">
+          {onFindUsages && (
+            <button className="remove-index" title="Find usages" disabled={refactorBusy} onClick={onFindUsages}>
+              <Search />
+            </button>
+          )}
+          {onRename && (
+            <button className="remove-index" title="Rename parameter" disabled={refactorBusy} onClick={onRename}>
+              <Pencil />
+            </button>
+          )}
+          <button className="remove-index" title="Remove parameter" onClick={onRemove}>
+            <Trash2 />
+          </button>
+        </div>
       </div>
       {expanded && (
         <div className="accordion-body">
@@ -2519,7 +3306,10 @@ function ParameterCard({
               />
             </label>
             <label>
-              Data type
+              <span className="field-label">
+                <span>Data type</span>
+                <b className="required-badge">Required</b>
+              </span>
               <select
                 value={parameter.dataType || 'number'}
                 onChange={(e) => {
@@ -2576,7 +3366,10 @@ function ParameterCard({
               </label>
             )}
             <label>
-              Parameter behavior
+              <span className="field-label">
+                <span>Parameter behavior</span>
+                <b className="required-badge">Required</b>
+              </span>
               <select
                 value={parameter.adaptive ? 'adaptive' : 'standard'}
                 disabled={(parameter.dataType || 'number') !== 'number'}
@@ -2606,7 +3399,10 @@ function ParameterCard({
             </label>
             {!parameter.adaptive && (
               <label>
-                Value source
+                <span className="field-label">
+                  <span>Value source</span>
+                  <b className="required-badge">Required</b>
+                </span>
                 <select
                   value={parameter.source}
                   onChange={(e) => {
@@ -4025,7 +4821,10 @@ function ParameterSourceEditor({
     return (
       <div className="span-three sql-source-settings">
         <label>
-          Data source <b className="required-badge">Required</b>
+          <span className="field-label">
+            <span>Data source</span>
+            <b className="required-badge">Required</b>
+          </span>
           <select
             value={parameter.dataSourceId || ''}
             onChange={(e) => onChange({ ...parameter, dataSourceId: e.target.value })}
@@ -4041,17 +4840,21 @@ function ParameterSourceEditor({
           </select>
         </label>
         <label>
-          SQL query <b className="required-badge">Required</b>
+          <span className="field-label">
+            <span>SQL query</span>
+            <b className="required-badge">Required</b>
+          </span>
           <SQLAutocomplete
             value={parameter.definition}
             onChange={(definition) => onChange({ ...parameter, definition })}
             references={[
               ...externalInputs
                 .filter((item) => item.name)
-                .map((item) => ({ name: item.name, source: 'External input' as const })),
+                .map((item) => ({ name: item.name, source: 'External input' as const, dataType: item.type })),
               ...previous
                 .filter((item) => item.key)
-                .map((item) => ({ name: item.key, source: 'Parameter' as const })),
+                .map((item) => ({ name: item.key, source: 'Parameter' as const, dataType: item.dataType || ('number' as const) })),
+              ...Object.keys(indexes).map((name) => ({ name, source: 'Model index', dataType: 'string' as const })),
             ]}
             placeholder="SELECT measured_value FROM metrology WHERE wafer_id = @wafer_id"
           />
@@ -4095,11 +4898,29 @@ function ParameterSourceEditor({
             </div>
           </div>
         )}
+        <SQLQueryTester
+          dataSourceId={parameter.dataSourceId}
+          query={parameter.definition}
+          queryType="parameter"
+          dataType={parameter.dataType || 'number'}
+          references={[
+            ...externalInputs
+              .filter((item) => item.name)
+              .map((item) => ({ name: item.name, source: 'External input', dataType: item.type })),
+            ...previous
+              .filter((item) => item.key)
+              .map((item) => ({ name: item.key, source: 'Parameter', dataType: item.dataType || ('number' as const) })),
+            ...Object.keys(indexes).map((name) => ({ name, source: 'Model index', dataType: 'string' as const })),
+          ]}
+        />
       </div>
     );
   return (
     <label className="span-three">
-      {sourceLabel(parameter.source, parameter.dataType || 'number')}
+      <span className="field-label">
+        <span>{sourceLabel(parameter.source, parameter.dataType || 'number')}</span>
+        <b className="required-badge">Required</b>
+      </span>
       {parameter.source === 'expression' ||
       parameter.source === 'formula' ||
       parameter.source === 'data-sample' ? (
@@ -4136,11 +4957,17 @@ function ParameterSourceEditor({
             ),
             ...[
               { name: 'CONTAINS(@, "value")', source: 'Data sample function', plain: true },
+              { name: 'MATCHES(@, "^value.*")', source: 'Data sample function', plain: true },
               { name: 'FIRST(@)', source: 'Data sample function', plain: true },
               { name: 'NTH(@, 2)', source: 'Data sample function', plain: true },
               { name: 'LAST(@)', source: 'Data sample function', plain: true },
             ],
             ...[
+              {
+                name: 'IS_NULL(@value)',
+                source: 'Conditional expression',
+                plain: true,
+              },
               { name: 'MEDIAN(@)', source: 'Aggregate function', plain: true },
               { name: 'RANGE(@)', source: 'Aggregate function', plain: true },
               { name: 'STDEV(@)', source: 'Aggregate function', plain: true },
@@ -4179,12 +5006,12 @@ function ParameterSourceEditor({
                 plain: true,
               },
               {
-                name: 'LOOKUP_ONE(@, column == @value, return_column)',
+                name: 'LOOKUP_ONE(@sample, @sample.column == @value, @sample.return_column)',
                 source: 'Lookup formula',
                 plain: true,
               },
               {
-                name: 'LOOKUP_FIRST(@, column == @value, return_column)',
+                name: 'LOOKUP_FIRST(@sample, @sample.column == @value, @sample.return_column)',
                 source: 'Lookup formula',
                 plain: true,
               },
@@ -4291,6 +5118,8 @@ function IndexEditor({
       />
       <p className="field-help">
         Machine, action, and material are required. Add more indexes for a narrower process context.
+        Use <code>*</code> as the only accepted value to match any non-empty value; an exact model
+        takes priority over a wildcard model.
       </p>
       <div className="index-editor">
         <div className="index-table-head">
@@ -4313,7 +5142,10 @@ function IndexEditor({
         ))}
         {additional.map(([key, values]) => (
           <div className="index-form-row" key={key}>
-            <strong>{key}</strong>
+            <div>
+              <strong>{key}</strong>
+              <small>Additional</small>
+            </div>
             <IndexValuesInput values={values} onChange={(next) => setValues(key, next)} />
             <button
               className="remove-index"
@@ -4346,7 +5178,9 @@ function IndexValuesInput({
       setDraft('');
       return;
     }
-    onChange([...values, next]);
+    if (next === '*') onChange(['*']);
+    else if (values.includes('*')) onChange([next]);
+    else onChange([...values, next]);
     setDraft('');
   };
   return (

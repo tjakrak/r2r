@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { type ChangeEvent, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   BookOpen,
@@ -16,6 +16,7 @@ import {
   Gauge,
   GitBranch,
   LogOut,
+  LoaderCircle,
   Menu,
   Plus,
   RefreshCw,
@@ -29,6 +30,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { appPath } from './paths';
 import ModelEditor, { DependencyDialog } from './ModelEditor';
 import tdkLogo from './assets/tdklogo.png';
 
@@ -93,9 +95,10 @@ type DataSample = {
   key: string;
   description?: string;
   source: 'sql' | 'static';
+  dataSourceId?: string;
   query: string;
   columns?: DataSampleColumn[];
-  rows?: Record<string, string | number | boolean>[];
+  rows?: Record<string, string | number | boolean | null>[];
   limit: number;
 };
 type Source = {
@@ -168,7 +171,13 @@ type Model = {
   outputs: string[];
   enabled: boolean;
 };
-type ConfigUser = { employeeId: string; loginId: string; role: User['role']; status: 'active' | 'disabled' };
+type ConfigUser = {
+  employeeId: string;
+  loginId: string;
+  displayName?: string;
+  role: User['role'];
+  status: 'active' | 'disabled';
+};
 type Config = { models: Model[]; sources: Source[]; inputDefinitions: InputDefinition[]; users?: ConfigUser[] };
 type ActivityRow = {
   id: string;
@@ -188,14 +197,44 @@ type RunRecord = {
   completedAt?: string;
   status: string;
   modelRevision: number;
-  outputs: { parameter: string; value: unknown }[];
+  context?: Record<string, unknown>;
+  parameters?: Record<string, unknown>;
+  disposition?: string;
+  outputs: {
+    parameter: string;
+    value: unknown;
+    calculatedValue?: unknown;
+    unit?: string;
+    lsl?: number;
+    usl?: number;
+    boundLimited?: boolean;
+    limitAction?: string;
+  }[];
   feedback?: Record<string, unknown>;
+};
+type ChartPoint = {
+  label: string;
+  value: number;
+  timestamp?: string;
+  runId?: string;
+  status?: string;
+  modelRevision?: number;
+  context?: Record<string, unknown>;
+  disposition?: string;
+  calculatedValue?: number;
+  unit?: string;
+  lsl?: number;
+  usl?: number;
+  boundLimited?: boolean;
+  limitAction?: string;
 };
 type ChartSeriesOption = {
   key: string;
   label: string;
-  category: 'Output' | 'Post-run feedback';
-  points: { label: string; value: number }[];
+  category: 'Parameter' | 'Output' | 'Post-run feedback';
+  points: ChartPoint[];
+  lsl?: number;
+  usl?: number;
 };
 type User = {
   employeeId: string;
@@ -205,6 +244,7 @@ type User = {
 };
 type RegisteredUser = User & {
   employeeId: string;
+  displayName?: string;
   email?: string;
   status?: 'active' | 'disabled';
 };
@@ -222,25 +262,43 @@ const newModel = (): Model => ({
   indexes: { machine: [], action: [], material: [] },
   externalInputs: [],
   feedbackInputs: [],
-  executionPolicy: { maxUnfinishedRuns: 1, partitionBy: ['machine'] },
+  executionPolicy: { maxUnfinishedRuns: 0, partitionBy: ['machine'] },
   parameters: [],
   dataSamples: [],
   outputs: [],
   enabled: false,
 });
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(appPath(path), {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
-  const data = await response.json();
+  const responseText = await response.text();
+  let data: any = {};
+  if (responseText.trim()) {
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      if (!response.ok) {
+        throw new Error(
+          `Request failed with HTTP ${response.status} ${response.statusText || ''}`.trim(),
+        );
+      }
+      throw new Error(`Server returned an invalid JSON response for ${path}.`);
+    }
+  }
   if (response.status === 401 && path !== '/api/login' && path !== '/api/session') {
     window.dispatchEvent(new CustomEvent('r2r:session-expired'));
     throw new Error('Your session expired. Please sign in again.');
   }
-  if (!response.ok) throw new Error(data.error || 'Request failed');
-  return data;
+  if (!response.ok) {
+    throw new Error(
+      data.error || `Request failed with HTTP ${response.status} ${response.statusText || ''}`.trim(),
+    );
+  }
+  if (!responseText.trim()) throw new Error(`Server returned an empty response for ${path}.`);
+  return data as T;
 }
 const formatDate = (value: string) =>
   new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(
@@ -662,6 +720,7 @@ export default function App() {
           model={selected}
           sources={config?.sources || []}
           inputDefinitions={config?.inputDefinitions || []}
+          registeredUsers={config?.users || []}
           role={user.role}
           onClose={() => setSelected(undefined)}
           onChanged={async () => {
@@ -871,6 +930,18 @@ function ModelImportDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
+  const loadDefinitionFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setError('');
+    try {
+      setDefinition(await file.text());
+    } catch {
+      setError(`Could not read ${file.name}. Please choose a valid JSON file.`);
+    }
+  };
+
   const importModel = async () => {
     setError('');
     let parsed: unknown;
@@ -914,11 +985,25 @@ function ModelImportDialog({
           </button>
         </header>
         <p>
-          Paste one model definition. R2R validates it and creates a new draft. IDs, revision,
-          ownership, status, and approval fields in the JSON are ignored.
+          Paste one model definition or load it from a local JSON file. You can review and edit the
+          JSON before R2R validates it and creates a new draft. IDs, revision, ownership, status,
+          and approval fields are ignored.
         </p>
+        <div className="model-import-source">
+          <span>Import source</span>
+          <label className="secondary" htmlFor="model-definition-file">
+            <Upload />
+            Choose JSON file
+          </label>
+          <input
+            id="model-definition-file"
+            type="file"
+            accept="application/json,.json"
+            onChange={loadDefinitionFile}
+          />
+        </div>
         <label>
-          Model JSON
+          Model JSON (paste or review uploaded file)
           <textarea
             value={definition}
             onChange={(event) => setDefinition(event.target.value)}
@@ -945,17 +1030,18 @@ const prepareExample = `POST /api/v1/runs/prepare
 Content-Type: application/json
 
 {
-  "runId": "LOT-2048-W01",
-  "context": {
+  "indexes": {
     "machine": "PROCESS-01",
     "action": "CALCULATE",
-    "material": "PRODUCT_A",
-    "operation": "REWORK",
+    "material": "PRODUCT_A"
+  },
+  "externalInputs": {
+    "operation": "ARI170",
     "measured_cd": 1.5
   }
 }`;
 
-const completeExample = `POST /api/v1/runs/LOT-2048-W01/complete
+const completeExample = `POST /api/v1/runs/{runId-from-prepare}/complete
 Content-Type: application/json
 
 {
@@ -1006,7 +1092,8 @@ function Documentation() {
                 <strong>Create a control model</strong>
                 <span>
                   Define the required machine, action, and material indexes, then add any additional
-                  selection indexes.
+                  selection indexes. Use <code>*</code> as an index's only accepted value when the
+                  model should match every non-empty caller value; exact matches take priority.
                 </span>
               </li>
               <li>
@@ -1095,17 +1182,114 @@ function Documentation() {
               order matters.
             </p>
             <p>
+              SQL and static samples may contain <code>NULL</code> cells. Use{' '}
+              <code>IS_NULL(FIRST(@sample.column))</code> to test one explicitly. Comparisons and
+              membership checks do not match NULL. Numerical aggregates, including{' '}
+              <code>COUNT(@sample.column)</code>, ignore NULL cells.
+            </p>
+            <p>
               <code>CONTAINS(@sample.text_column, "value")</code> returns a boolean and is true when
-              any row contains the supplied text. Matching is case-insensitive.
+              any row exactly equals the supplied text. Matching is case-insensitive. Use{' '}
+              <code>MATCHES(@sample.text_column, "^pattern$")</code> for regular-expression matching.
             </p>
             <h3>Typed SQL schemas and lookups</h3>
             <p>
               SQL samples may declare expected text, number, and boolean columns. Every returned or
               simulation-supplied row is validated before calculations execute. Use{' '}
               <code>LOOKUP_ONE</code> when exactly one row must match or <code>LOOKUP_FIRST</code>{' '}
-              when the first matching row is intentional. Filters support typed comparisons,
-              <code>CONTAINS</code>, <code>AND</code>, and <code>OR</code>.
+              when the first matching row is intentional. Both return null when no row matches;
+              handle that result with <code>IS_NULL(...)</code> when a fallback is required. Lookup filters support typed comparisons
+              joined by <code>AND</code> and <code>OR</code>. The sample and every one of its columns
+              use qualified references: <code>@sample_name</code> and{' '}
+              <code>@sample_name.column_name</code>.
             </p>
+            <h3>Expression examples</h3>
+            <p>
+              References begin with <code>@</code>; function names do not. Text uses double quotes,
+              booleans use <code>true</code> or <code>false</code>, and the expression result must
+              match the parameter data type.
+            </p>
+            <div className="documentation-example-grid">
+              <article>
+                <strong>IF with a numerical comparison</strong>
+                <span>Return 3 when the latest CD is above 1; otherwise return 0.</span>
+                <pre>{`IF(@latest_cd > 1, 3, 0)`}</pre>
+              </article>
+              <article>
+                <strong>IF returning text</strong>
+                <span>Select one of two recipe names from an operation.</span>
+                <pre>{`IF(@operation == "ARI170", "RECIPE_A", "RECIPE_B")`}</pre>
+              </article>
+              <article>
+                <strong>Nullable lookup fallback</strong>
+                <span>Return a fallback when a previous lookup did not find a matching row.</span>
+                <pre>{`IF(IS_NULL(@previous_recipe), "DEFAULT_RECIPE", @previous_recipe)`}</pre>
+              </article>
+              <article>
+                <strong>IF with AND and OR</strong>
+                <span>Combine boolean conditions before choosing the result.</span>
+                <pre>{`IF(@is_rework AND (@measured_cd > @target_cd OR @force_adjust), @base_adjustment + 2, @base_adjustment)`}</pre>
+              </article>
+              <article>
+                <strong>Nested IF</strong>
+                <span>Use another IF when more than two outcomes are required.</span>
+                <pre>{`IF(@value < 0, "LOW", IF(@value > 10, "HIGH", "NORMAL"))`}</pre>
+              </article>
+              <article>
+                <strong>Exact lookup</strong>
+                <span>Require exactly one matching operation and product row.</span>
+                <pre>{`LOOKUP_ONE(@rules, @rules.operation == @operation AND @rules.product == @product, @rules.recipe)`}</pre>
+              </article>
+              <article>
+                <strong>Ordered range lookup</strong>
+                <span>Return the first matching bound from an intentionally ordered rule table.</span>
+                <pre>{`LOOKUP_FIRST(@rules, @rules.operation == @operation AND @rules.upper_bound >= @measured_cd, @rules.recipe)`}</pre>
+              </article>
+              <article className="wide">
+                <strong>Conditional lookup boundary</strong>
+                <span>
+                  Put IF outside the lookup. Functions are not allowed inside a lookup predicate.
+                </span>
+                <pre>{`IF(@operation == "CLU200",
+  LOOKUP_FIRST(@rules, @rules.operation == @operation AND @rules.upper_bound > @value, @rules.recipe),
+  LOOKUP_FIRST(@rules, @rules.operation == @operation AND @rules.upper_bound >= @value, @rules.recipe))`}</pre>
+              </article>
+              <article>
+                <strong>Aggregate calculation</strong>
+                <span>Calculate the average of a numerical sample column.</span>
+                <pre>{`AVG(@history.measurement)`}</pre>
+              </article>
+              <article>
+                <strong>Specific sample row</strong>
+                <span>Select the second row; NTH positions start at 1.</span>
+                <pre>{`NTH(@history.measurement, 2)`}</pre>
+              </article>
+              <article>
+                <strong>Exact column value</strong>
+                <span>Return true when any value in the text column exactly equals the supplied text.</span>
+                <pre>{`CONTAINS(@history.comment, "rework")`}</pre>
+              </article>
+              <article>
+                <strong>Regular-expression match</strong>
+                <span>Return true when any text value matches the supplied regular expression.</span>
+                <pre>{`MATCHES(@history.comment, "^rework-[0-9]+$")`}</pre>
+              </article>
+              <article>
+                <strong>Math functions</strong>
+                <span>Combine supported functions with normal arithmetic.</span>
+                <pre>{`ROUND(ABS(@target_cd - @measured_cd) * 1000)`}</pre>
+              </article>
+              <article>
+                <strong>String functions</strong>
+                <span>Clean and combine text values.</span>
+                <pre>{`CONCAT(UPPER(TRIM(@operation)), "_RECIPE")`}</pre>
+              </article>
+            </div>
+            <div className="documentation-note">
+              Both IF result branches must return the parameter's declared type. For example, a
+              number parameter may use <code>IF(@condition, 1, 0)</code>, but not{' '}
+              <code>IF(@condition, 1, "none")</code>.
+            </div>
             <h3>Limits and adaptive behavior</h3>
             <p>
               Every numerical parameter may define LSL and USL actions, including parameters that are not model outputs. Limits are checked as soon as the parameter resolves: warn keeps the value, clamp and fallback supply the value used by dependent parameters, and reject stops the run.
@@ -1134,8 +1318,8 @@ function Documentation() {
             <h2>Execution API</h2>
             <h3>1. Prepare a run</h3>
             <p>
-              The caller sends a unique run ID, model-selection indexes, and declared external
-              inputs. R2R selects the active revision, resolves parameters, and returns every
+              The caller sends model-selection indexes and declared external inputs. R2R generates
+              the run ID, selects the active revision, resolves parameters, and returns every
               configured output.
             </p>
             <pre>{prepareExample}</pre>
@@ -1148,8 +1332,9 @@ function Documentation() {
             <pre>{completeExample}</pre>
             <div className="documentation-note">
               A prepare request remains unfinished until completion succeeds. The model execution
-              policy controls how many unfinished runs are allowed for each configured partition,
-              such as a machine and chamber combination.
+              policy may limit how many unfinished runs are allowed for each configured partition,
+              such as a machine and chamber combination. When no limit is configured, unfinished
+              runs are unlimited.
             </div>
           </section>
 
@@ -1216,16 +1401,52 @@ function FilterSelect({
   );
 }
 
-function simulationCSVTemplate(model?: Model) {
+type SimulationSampleMode = 'database' | 'csv';
+
+function simulationCSVTemplate(model?: Model, sampleModes: Record<string, SimulationSampleMode> = {}) {
   if (!model) return '';
   return [
     ...Object.keys(model.indexes),
     ...(model.externalInputs || []).map((input) => input.name),
     ...model.parameters.filter((parameter) => parameter.source === 'sql').map((parameter) => parameter.key),
     ...(model.dataSamples || [])
-      .filter((sample) => sample.source === 'sql')
-      .flatMap((sample) => (sample.columns || []).map((column) => `${sample.key}.${column.name}`)),
+      .filter((sample) => sample.source === 'sql' && sampleModes[sample.key] === 'csv')
+      .flatMap((sample) =>
+        Array.from({ length: Math.min(Math.max(sample.limit || 1, 1), 5) }, (_, row) =>
+          (sample.columns || []).map((column) => `${sample.key}[${row}].${column.name}`),
+        ).flat(),
+      ),
   ].join(',');
+}
+
+function simulationSampleModeError(
+  csv: string,
+  model: Model,
+  sampleModes: Record<string, SimulationSampleMode>,
+) {
+  const headerLine = csv.split(/\r?\n/, 1)[0] || '';
+  const headers = headerLine.split(',').map((header) => header.trim());
+  for (const sample of (model.dataSamples || []).filter((item) => item.source === 'sql')) {
+    const sampleHeaders = headers.filter(
+      (header) => header.startsWith(`${sample.key}.`) || header.startsWith(`${sample.key}[`),
+    );
+    if (sampleModes[sample.key] === 'csv' && sampleHeaders.length === 0) {
+      return `${sample.key} is configured to use CSV sample data, but its columns are missing from the uploaded file.`;
+    }
+    if (sampleModes[sample.key] !== 'csv' && sampleHeaders.length > 0) {
+      return `${sample.key} is configured to query the connected database, but the CSV contains sample columns for it. Remove those columns or select Provide in CSV.`;
+    }
+    if (sampleHeaders.length > 0) {
+      const suppliedColumns = new Set(
+        sampleHeaders.map((header) => header.slice(header.lastIndexOf('.') + 1).toLowerCase()),
+      );
+      const missing = (sample.columns || [])
+        .map((column) => column.name)
+        .filter((column) => !suppliedColumns.has(column.toLowerCase()));
+      if (missing.length) return `${sample.key} is missing required CSV columns: ${missing.join(', ')}.`;
+    }
+  }
+  return '';
 }
 
 function Simulation({
@@ -1241,7 +1462,7 @@ function Simulation({
 }) {
   const [selectedModelId, setSelectedModelId] = useState(model?.id || modelId);
   const selectedModel = model || models.find((candidate) => candidate.id === selectedModelId);
-  const template = simulationCSVTemplate(selectedModel);
+  const [sampleModes, setSampleModes] = useState<Record<string, SimulationSampleMode>>({});
   const [csv, setCSV] = useState('');
   const [fileName, setFileName] = useState('');
   const [results, setResults] = useState<any[]>();
@@ -1249,11 +1470,27 @@ function Simulation({
   const [showExchange, setShowExchange] = useState(false);
   const [sequential, setSequential] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [downloadingTemplate, setDownloadingTemplate] = useState(false);
   const [error, setError] = useState('');
   const [showChart, setShowChart] = useState(false);
   const [notice, setNotice] = useState('');
+  useEffect(() => {
+    setSampleModes(
+      Object.fromEntries(
+        (selectedModel?.dataSamples || [])
+          .filter((sample) => sample.source === 'sql')
+          .map((sample) => [sample.key, 'database' as const]),
+      ),
+    );
+  }, [selectedModel?.id]);
+  const template = simulationCSVTemplate(selectedModel, sampleModes);
   const chartSeries = useMemo<ChartSeriesOption[]>(() => {
     if (!results) return [];
+    const numericalParameters = (selectedModel?.parameters || []).filter(
+      (parameter) =>
+        (parameter.dataType || 'number') === 'number' &&
+        !(selectedModel?.outputs || []).includes(parameter.key),
+    );
     const outputNames = Array.from(
       new Set(
         results.flatMap((row) =>
@@ -1273,14 +1510,48 @@ function Simulation({
       ),
     );
     return [
+      ...numericalParameters.map((parameter) => ({
+        key: `parameter:${parameter.key}`,
+        label: parameter.key,
+        category: 'Parameter' as const,
+        lsl: parameter.lsl,
+        usl: parameter.usl,
+        points: results.flatMap((row) => {
+          const value = finiteNumber(row.parameters?.[parameter.key]);
+          return value !== undefined
+            ? [{
+                label: `Row ${row.row}`,
+                value,
+                status: row.status,
+                unit: parameter.unit,
+                lsl: parameter.lsl,
+                usl: parameter.usl,
+              }]
+            : [];
+        }),
+      })),
       ...outputNames.map((name) => ({
         key: `output:${name}`,
         label: name,
         category: 'Output' as const,
+        lsl: selectedModel?.parameters.find((parameter) => parameter.key === name)?.lsl,
+        usl: selectedModel?.parameters.find((parameter) => parameter.key === name)?.usl,
         points: results.flatMap((row) => {
           const output = (row.outputs || []).find((item: any) => item.parameter === name);
           const value = finiteNumber(output?.value);
-          return value !== undefined ? [{ label: `Row ${row.row}`, value }] : [];
+          return value !== undefined
+            ? [{
+                label: `Row ${row.row}`,
+                value,
+                status: row.status,
+                calculatedValue: finiteNumber(output?.calculatedValue),
+                unit: output?.unit,
+                lsl: output?.lsl,
+                usl: output?.usl,
+                boundLimited: output?.boundLimited,
+                limitAction: output?.limitAction,
+              }]
+            : [];
         }),
       })),
       ...feedbackNames.map((name) => ({
@@ -1294,8 +1565,15 @@ function Simulation({
         ),
       })),
     ];
-  }, [results]);
+  }, [results, selectedModel]);
   const run = async () => {
+    if (selectedModel) {
+      const sourceError = simulationSampleModeError(csv, selectedModel, sampleModes);
+      if (sourceError) {
+        setError(sourceError);
+        return;
+      }
+    }
     setBusy(true);
     setError('');
     try {
@@ -1323,14 +1601,24 @@ function Simulation({
     };
     reader.readAsText(file);
   };
-  const downloadTemplate = () => {
-    if (!selectedModel) return;
-    const blob = new Blob([`${template}\n`], { type: 'text/csv;charset=utf-8' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedModel.familyId || 'simulation'}-simulation-template.csv`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+  const downloadTemplate = async () => {
+    if (!selectedModel || downloadingTemplate) return;
+    setDownloadingTemplate(true);
+    try {
+      // Yield so React can paint the busy state before preparing a large template.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const blob = new Blob([`${template}\n`], { type: 'text/csv;charset=utf-8' });
+      const link = document.createElement('a');
+      const downloadURL = URL.createObjectURL(blob);
+      link.href = downloadURL;
+      link.download = `${selectedModel.familyId || 'simulation'}-simulation-template.csv`;
+      link.click();
+      URL.revokeObjectURL(downloadURL);
+      // Keep the feedback visible briefly and guard against accidental double-clicks.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 700));
+    } finally {
+      setDownloadingTemplate(false);
+    }
   };
   return (
     <section className="page">
@@ -1372,8 +1660,9 @@ function Simulation({
             <span>2</span>
             <div>
               <strong>Download and complete the CSV template</strong>
-              <button className="secondary" disabled={!selectedModel} onClick={downloadTemplate}>
-                <Download /> Download template
+              <button className="secondary" disabled={!selectedModel || downloadingTemplate} onClick={downloadTemplate}>
+                {downloadingTemplate ? <LoaderCircle className="button-spinner" /> : <Download />}
+                {downloadingTemplate ? 'Preparing template…' : 'Download template'}
               </button>
             </div>
           </div>
@@ -1401,8 +1690,9 @@ function Simulation({
             </div>
             <div className="simulation-upload-actions">
               {modelId && (
-                <button className="secondary" onClick={downloadTemplate}>
-                  <Download /> Template
+                <button className="secondary" disabled={downloadingTemplate} onClick={downloadTemplate}>
+                  {downloadingTemplate ? <LoaderCircle className="button-spinner" /> : <Download />}
+                  {downloadingTemplate ? 'Preparing…' : 'Template'}
                 </button>
               )}
               {selectedModel ? (
@@ -1428,6 +1718,50 @@ function Simulation({
               routing or persisted adaptive state.
             </p>
           )}
+          {selectedModel &&
+            (selectedModel.dataSamples || []).some((sample) => sample.source === 'sql') && (
+              <section className="simulation-sample-sources">
+                <header>
+                  <strong>SQL data samples</strong>
+                  <span>Choose where each sample comes from during this simulation.</span>
+                </header>
+                {(selectedModel.dataSamples || [])
+                  .filter((sample) => sample.source === 'sql')
+                  .map((sample) => (
+                    <div key={sample.key}>
+                      <div>
+                        <strong>@{sample.key}</strong>
+                        <small>
+                          {sampleModes[sample.key] === 'csv'
+                            ? 'CSV values replace the SQL query. Supply every required column and row.'
+                            : `The backend executes this sample against ${sample.dataSourceId || 'its configured data source'} for every CSV row.`}
+                        </small>
+                      </div>
+                      <select
+                        value={sampleModes[sample.key] || 'database'}
+                        onChange={(event) => {
+                          setSampleModes({
+                            ...sampleModes,
+                            [sample.key]: event.target.value as SimulationSampleMode,
+                          });
+                          setCSV('');
+                          setFileName('');
+                          setResults(undefined);
+                          setExchange(undefined);
+                          setError('');
+                        }}
+                      >
+                        <option value="database">Query connected database</option>
+                        <option value="csv">Provide sample rows in CSV</option>
+                      </select>
+                    </div>
+                  ))}
+                <p>
+                  The downloaded template changes with these selections. CSV mode includes up to
+                  five indexed rows; add more numbered row groups if the test requires them.
+                </p>
+              </section>
+            )}
           <div className="simulation-file-state">
             <div>
               <small>EXPECTED CSV COLUMNS</small>
@@ -1501,6 +1835,13 @@ function Simulation({
                     <div>
                       <strong>Row {row.row}</strong>
                       <small>{row.model || row.error}</small>
+                      {row.dataSampleSources && (
+                        <small className="simulation-sample-source-summary">
+                          {Object.entries(row.dataSampleSources)
+                            .map(([name, source]) => `${name}: ${source}`)
+                            .join('\n· ')}
+                        </small>
+                      )}
                     </div>
                     <span className={`status ${row.status === 'completed' ? 'approved' : 'draft'}`}>
                       {row.status}
@@ -1508,7 +1849,7 @@ function Simulation({
                     {row.outputs && (
                       <code>
                         {row.outputs
-                          .map((output: any) => `${output.parameter}=${output.value}`)
+                          .map((output: any) => `${output.parameter}=${formatParameterValue(output.value)}`)
                           .join(' · ')}
                       </code>
                     )}
@@ -1609,7 +1950,7 @@ function Simulation({
 }
 
 function formatParameterValue(value: unknown) {
-  if (value === null) return 'null';
+  if (value === null) return 'NULL';
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
 }
@@ -1624,10 +1965,16 @@ function finiteNumber(value: unknown) {
 function NumericHistoryChart({
   title,
   series,
+  lsl,
+  usl,
 }: {
   title: string;
-  series: { label: string; value: number }[];
+  series: ChartPoint[];
+  lsl?: number;
+  usl?: number;
 }) {
+  const [hovered, setHovered] = useState<ChartPoint>();
+  const [selected, setSelected] = useState<ChartPoint>();
   if (!series.length) {
     return (
       <div className="history-chart empty-chart">
@@ -1637,31 +1984,109 @@ function NumericHistoryChart({
     );
   }
   const values = series.map((point) => point.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const domainValues = [...values, ...(lsl !== undefined ? [lsl] : []), ...(usl !== undefined ? [usl] : [])];
+  const min = Math.min(...domainValues);
+  const max = Math.max(...domainValues);
   const range = max - min || 1;
-  const points = series
-    .map((point, index) => {
-      const x = series.length === 1 ? 50 : (index / (series.length - 1)) * 100;
-      const y = 88 - ((point.value - min) / range) * 72;
-      return `${x},${y}`;
-    })
-    .join(' ');
+  const chartPoint = (point: ChartPoint, index: number) => ({
+    x: series.length === 1 ? 400 : 32 + (index / (series.length - 1)) * 736,
+    y: 215 - ((point.value - min) / range) * 175,
+  });
+  const points = series.map((point, index) => {
+    const position = chartPoint(point, index);
+    return `${position.x},${position.y}`;
+  }).join(' ');
+  const limitY = (value: number) => 215 - ((value - min) / range) * 175;
+  const tone = (point: ChartPoint) => {
+    const failed = /failed|cancelled/i.test(point.status || '');
+    const outside =
+      (point.lsl !== undefined && point.value < point.lsl) ||
+      (point.usl !== undefined && point.value > point.usl) ||
+      point.disposition === 'run_rejected';
+    if (outside) return 'rejected';
+    if (point.boundLimited || point.limitAction) return 'warning';
+    if (failed || point.status === 'prepared') return 'inactive';
+    return 'normal';
+  };
+  const average = values.reduce((total, value) => total + value, 0) / values.length;
+  const exceptional = series.filter((point) => tone(point) !== 'normal').length;
+  const detail = hovered || selected;
+  const detailPinned = Boolean(selected && !hovered);
   return (
     <div className="history-chart">
       <header>
         <strong>{title}</strong>
         <span>
-          {series.length} runs · {min.toFixed(2)}–{max.toFixed(2)}
+          {series.length} runs · Avg {average.toFixed(2)} · Min {Math.min(...values).toFixed(2)} · Max{' '}
+          {Math.max(...values).toFixed(2)} · {exceptional} flagged
         </span>
       </header>
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-label={title}>
-        <line x1="0" y1="88" x2="100" y2="88" />
+      <svg viewBox="0 0 800 240" preserveAspectRatio="xMidYMid meet" aria-label={title}>
+        <line x1="20" y1="215" x2="780" y2="215" />
+        {lsl !== undefined && (
+          <g className="chart-limit lsl">
+            <line x1="20" y1={limitY(lsl)} x2="780" y2={limitY(lsl)} />
+            <text x="24" y={limitY(lsl) - 5}>LSL {lsl}</text>
+          </g>
+        )}
+        {usl !== undefined && (
+          <g className="chart-limit usl">
+            <line x1="20" y1={limitY(usl)} x2="780" y2={limitY(usl)} />
+            <text x="24" y={limitY(usl) - 5}>USL {usl}</text>
+          </g>
+        )}
         <polyline points={points} />
+        {series.map((point, index) => {
+          const position = chartPoint(point, index);
+          return (
+            <circle
+              key={`${point.runId || point.label}-${index}`}
+              className={`chart-point ${tone(point)} ${selected === point ? 'selected' : ''}`}
+              cx={position.x}
+              cy={position.y}
+              r="5"
+              tabIndex={0}
+              onMouseEnter={() => setHovered(point)}
+              onMouseLeave={() => setHovered(undefined)}
+              onFocus={() => setHovered(point)}
+              onBlur={() => setHovered(undefined)}
+              onClick={() => setSelected((current) => (current === point ? undefined : point))}
+            >
+              <title>{`${point.label}: ${point.value}${point.unit ? ` ${point.unit}` : ''}`}</title>
+            </circle>
+          );
+        })}
       </svg>
-      <div>
+      <div className="chart-axis-labels">
         <span>{series[0].label}</span>
         <span>{series[series.length - 1].label}</span>
+      </div>
+      <div className={`chart-point-details ${detailPinned ? 'pinned' : ''} ${detail ? 'visible' : ''}`}>
+        {detail ? (
+          <>
+            <header>
+              <strong>{detail.runId ? `Run ${detail.runId}` : detail.label}</strong>
+              <span>{detailPinned ? 'SELECTED RUN' : 'POINT PREVIEW'}</span>
+            </header>
+            <dl>
+              <div><dt>Value</dt><dd>{detail.value}{detail.unit ? ` ${detail.unit}` : ''}</dd></div>
+              {detail.calculatedValue !== undefined && detail.calculatedValue !== detail.value && (
+                <div><dt>Calculated</dt><dd>{detail.calculatedValue}{detail.unit ? ` ${detail.unit}` : ''}</dd></div>
+              )}
+              {detail.status && <div><dt>Status</dt><dd>{detail.status}</dd></div>}
+              {detail.modelRevision !== undefined && <div><dt>Revision</dt><dd>{detail.modelRevision}</dd></div>}
+              {detail.timestamp && <div><dt>Time</dt><dd>{new Date(detail.timestamp).toLocaleString()}</dd></div>}
+              {detail.limitAction && <div><dt>Limit action</dt><dd>{detail.limitAction}</dd></div>}
+              {Object.entries(detail.context || {}).map(([name, value]) => (
+                <div key={name}><dt>{name}</dt><dd>{formatParameterValue(value)}</dd></div>
+              ))}
+            </dl>
+          </>
+        ) : (
+          <span className="chart-point-details-placeholder">
+            Hover over a point for a preview, or click it to keep the run details open.
+          </span>
+        )}
       </div>
     </div>
   );
@@ -1676,13 +2101,20 @@ function ChartSeriesDialog({
   options: ChartSeriesOption[];
   onClose: () => void;
 }) {
-  const [selectedKey, setSelectedKey] = useState(options[0]?.key || '');
+  const [selectedKeys, setSelectedKeys] = useState(() => options.slice(0, 1).map((option) => option.key));
+  const [timeRange, setTimeRange] = useState<'24h' | '7d' | '14d' | '30d'>('14d');
   useEffect(() => {
-    if (!options.some((option) => option.key === selectedKey)) {
-      setSelectedKey(options[0]?.key || '');
-    }
-  }, [options, selectedKey]);
-  const selected = options.find((option) => option.key === selectedKey);
+    setSelectedKeys((current) => {
+      const available = current.filter((key) => options.some((option) => option.key === key));
+      return available.length ? available : options.slice(0, 1).map((option) => option.key);
+    });
+  }, [options]);
+  const selectedOptions = options.filter((option) => selectedKeys.includes(option.key));
+  const hasTimestamps = selectedOptions.some((option) => option.points.some((point) => point.timestamp));
+  const duration = { '24h': 24 * 60 * 60 * 1000, '7d': 7 * 86400000, '14d': 14 * 86400000, '30d': 30 * 86400000 }[timeRange];
+  const filteredPoints = (option: ChartSeriesOption) => option.points
+    .filter((point) => !point.timestamp || Date.now() - new Date(point.timestamp).getTime() <= duration)
+    .sort((left, right) => (left.timestamp || '').localeCompare(right.timestamp || ''));
   return (
     <div
       className="payload-backdrop chart-dialog-backdrop"
@@ -1698,20 +2130,53 @@ function ChartSeriesDialog({
             <X />
           </button>
         </header>
-        <label className="chart-series-select">
-          Numerical series
-          <select value={selectedKey} onChange={(event) => setSelectedKey(event.target.value)}>
-            {options.map((option) => (
-              <option key={option.key} value={option.key}>
-                {option.category} · {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <NumericHistoryChart
-          title={selected ? `${selected.category} · ${selected.label}` : 'Run history'}
-          series={selected?.points || []}
-        />
+        <div className="chart-controls">
+          <fieldset className="chart-series-picker">
+            <legend>Numerical series</legend>
+            <small>Select up to four series. Each keeps its own scale and engineering unit.</small>
+            <div>
+              {options.map((option) => (
+                <label key={option.key}>
+                  <input
+                    type="checkbox"
+                    checked={selectedKeys.includes(option.key)}
+                    disabled={!selectedKeys.includes(option.key) && selectedKeys.length >= 4}
+                    onChange={() =>
+                      setSelectedKeys((current) =>
+                        current.includes(option.key)
+                          ? current.length > 1
+                            ? current.filter((key) => key !== option.key)
+                            : current
+                          : [...current, option.key],
+                      )
+                    }
+                  />
+                  <span>{option.category} · {option.label}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+          {hasTimestamps && (
+            <div className="chart-range-control" aria-label="Chart time range">
+              {(['24h', '7d', '14d', '30d'] as const).map((range) => (
+                <button type="button" className={timeRange === range ? 'active' : ''} onClick={() => setTimeRange(range)} key={range}>
+                  {range}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className={`chart-series-grid ${selectedOptions.length > 1 ? 'multiple' : ''}`}>
+          {selectedOptions.map((option) => (
+            <NumericHistoryChart
+              key={option.key}
+              title={`${option.category} · ${option.label}`}
+              series={filteredPoints(option)}
+              lsl={option.lsl}
+              usl={option.usl}
+            />
+          ))}
+        </div>
       </section>
     </div>
   );
@@ -1797,6 +2262,7 @@ function InputRegistry({
 function UserManagement() {
   const [users, setUsers] = useState<RegisteredUser[]>([]);
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<RegisteredUser>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -1880,6 +2346,9 @@ function UserManagement() {
                   </span>
                 </span>
                 <span className="user-registry-action">
+                  <button className="secondary" onClick={() => setEditing(registered)}>
+                    Edit role
+                  </button>
                   <button
                     className="secondary"
                     onClick={() =>
@@ -1912,7 +2381,80 @@ function UserManagement() {
           }}
         />
       )}
+      {editing && (
+        <EditUserRoleDialog
+          registered={editing}
+          onClose={() => setEditing(undefined)}
+          onSaved={async () => {
+            setEditing(undefined);
+            await loadUsers();
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function EditUserRoleDialog({
+  registered,
+  onClose,
+  onSaved,
+}: {
+  registered: RegisteredUser;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [role, setRole] = useState<User['role']>(registered.role);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const save = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await api<RegisteredUser>(`/api/users/${encodeURIComponent(registered.employeeId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ role, status: registered.status || 'active' }),
+      });
+      await onSaved();
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="payload-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="add-user-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-user-role-title">
+        <header>
+          <div>
+            <p>ACCESS CONTROL</p>
+            <h3 id="edit-user-role-title">Edit user role</h3>
+          </div>
+          <button className="icon" onClick={onClose} aria-label="Close role editor">
+            <X />
+          </button>
+        </header>
+        <p>
+          Change the R2R permissions for {registered.displayName || registered.username} ({registered.employeeId}).
+        </p>
+        <label>
+          R2R role
+          <select value={role} onChange={(event) => setRole(event.target.value as User['role'])} autoFocus>
+            <option value="viewer">Viewer</option>
+            <option value="engineer">Engineer</option>
+            <option value="engineering_manager">Engineering manager</option>
+            <option value="admin">Administrator</option>
+          </select>
+        </label>
+        {error && <p className="error">{error}</p>}
+        <footer>
+          <button className="secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="primary" onClick={save} disabled={busy || role === registered.role}>
+            {busy ? 'Saving…' : 'Save role'}
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -1955,7 +2497,7 @@ function AddUserDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () 
         </p>
         <label>
           Employee ID
-          <input value={employeeId} onChange={(event) => setEmployeeId(event.target.value)} placeholder="E300" autoFocus />
+          <input value={employeeId} onChange={(event) => setEmployeeId(event.target.value)} placeholder="#000000#" autoFocus />
         </label>
         <label>
           R2R role
@@ -2386,7 +2928,7 @@ function SectionTitle({ text }: { text: string }) {
   return <h3 className="source-section-title">{text}</h3>;
 }
 function Login({ onLogin, message }: { onLogin: (user: User) => Promise<void>; message?: string }) {
-  const [username, setUsername] = useState('engineer');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -2519,7 +3061,9 @@ function ModelRow({ model, ownerInactive, onOpen }: { model: Model; ownerInactiv
             <span className={`status ${model.status}`}>
               REV {model.revision}{' '}
               {model.status === 'approved'
-                ? 'ACTIVE'
+                ? model.enabled
+                  ? 'ACTIVE'
+                  : 'RETIRED'
                 : model.status === 'pending_approval'
                   ? 'PENDING APPROVAL'
                   : model.status.toUpperCase()}
@@ -2567,7 +3111,7 @@ function modelEditorForm(
     externalInputs: (model.externalInputs || []).map((item) => ({ ...item })),
     feedbackInputs: (model.feedbackInputs || []).map((item) => ({ ...item })),
     executionPolicy: {
-      maxUnfinishedRuns: model.executionPolicy?.maxUnfinishedRuns || 1,
+      maxUnfinishedRuns: model.executionPolicy?.maxUnfinishedRuns ?? 0,
       partitionBy: model.executionPolicy?.partitionBy || [],
     },
     parameters: model.parameters.map((item): Parameter => ({
@@ -2599,6 +3143,7 @@ function ModelDrawer({
   model,
   sources,
   inputDefinitions,
+  registeredUsers,
   role,
   onClose,
   onChanged,
@@ -2606,6 +3151,7 @@ function ModelDrawer({
   model: Model;
   sources: Source[];
   inputDefinitions: InputDefinition[];
+  registeredUsers: ConfigUser[];
   role: User['role'];
   onClose: () => void;
   onChanged: () => Promise<void>;
@@ -2628,27 +3174,81 @@ function ModelDrawer({
   const currentModelStatus = currentModel.status;
   const canDevelop = role === 'engineer' || role === 'engineering_manager' || role === 'admin';
   const canApprove = role === 'engineering_manager' || role === 'admin';
+  const activeRevision = history.find((item) => item.status === 'approved' && item.enabled) ||
+    (model.status === 'approved' && model.enabled ? model : undefined);
+  const displayNameFor = (employeeId?: string) => {
+    const normalized = employeeId?.trim();
+    if (!normalized) return 'Unknown user';
+    const registered = registeredUsers.find(
+      (candidate) => candidate.employeeId.toLowerCase() === normalized.toLowerCase(),
+    );
+    return registered?.displayName?.trim() || normalized;
+  };
   const historyChartSeries = useMemo<ChartSeriesOption[]>(() => {
     const parameters = new Map(model.parameters.map((parameter) => [parameter.key, parameter]));
-    const outputOptions = model.outputs
-      .filter((name) => (parameters.get(name)?.dataType || 'number') === 'number')
-      .map((name) => ({
-        key: `output:${name}`,
-        label: name,
-        category: 'Output' as const,
+    const runPoint = (run: RunRecord, timestamp: string): Omit<ChartPoint, 'label' | 'value'> => ({
+      timestamp,
+      runId: run.runId,
+      status: run.status,
+      modelRevision: run.modelRevision,
+      context: run.context,
+      disposition: run.disposition,
+    });
+    const parameterOptions = model.parameters
+      .filter(
+        (parameter) =>
+          (parameter.dataType || 'number') === 'number' && !model.outputs.includes(parameter.key),
+      )
+      .map((parameter) => ({
+        key: `parameter:${parameter.key}`,
+        label: parameter.key,
+        category: 'Parameter' as const,
+        lsl: parameter.lsl,
+        usl: parameter.usl,
         points: runs.flatMap((run) => {
-          const output = (run.outputs || []).find((item) => item.parameter === name);
-          const value = finiteNumber(output?.value);
+          const value = finiteNumber(run.parameters?.[parameter.key]);
           return value !== undefined
-            ? [
-                {
-                  label: new Date(run.preparedAt).toLocaleDateString(),
-                  value,
-                },
-              ]
+            ? [{
+                ...runPoint(run, run.preparedAt),
+                label: new Date(run.preparedAt).toLocaleString(),
+                value,
+                unit: parameter.unit,
+                lsl: parameter.lsl,
+                usl: parameter.usl,
+              }]
             : [];
         }),
       }));
+    const outputOptions = model.outputs
+      .filter((name) => (parameters.get(name)?.dataType || 'number') === 'number')
+      .map((name) => {
+        const parameter = parameters.get(name);
+        return {
+          key: `output:${name}`,
+          label: name,
+          category: 'Output' as const,
+          lsl: parameter?.lsl,
+          usl: parameter?.usl,
+          points: runs.flatMap((run) => {
+            const output = (run.outputs || []).find((item) => item.parameter === name);
+            const value = finiteNumber(output?.value);
+            const calculatedValue = finiteNumber(output?.calculatedValue);
+            return value !== undefined
+              ? [{
+                  ...runPoint(run, run.preparedAt),
+                  label: new Date(run.preparedAt).toLocaleString(),
+                  value,
+                  calculatedValue,
+                  unit: output?.unit || parameter?.unit,
+                  lsl: output?.lsl ?? parameter?.lsl,
+                  usl: output?.usl ?? parameter?.usl,
+                  boundLimited: output?.boundLimited,
+                  limitAction: output?.limitAction,
+                }]
+              : [];
+          }),
+        };
+      });
     const feedbackOptions = (model.feedbackInputs || [])
       .filter((input) => input.type === 'number')
       .map((input) => ({
@@ -2660,14 +3260,15 @@ function ModelDrawer({
           return value !== undefined
             ? [
                 {
-                  label: new Date(run.completedAt || run.preparedAt).toLocaleDateString(),
+                  ...runPoint(run, run.completedAt || run.preparedAt),
+                  label: new Date(run.completedAt || run.preparedAt).toLocaleString(),
                   value,
                 },
               ]
             : [];
         }),
       }));
-    return [...outputOptions, ...feedbackOptions];
+    return [...parameterOptions, ...outputOptions, ...feedbackOptions];
   }, [model.feedbackInputs, model.outputs, model.parameters, runs]);
   const refreshHistory = async () => {
     if (model.id) setHistory(await api<Model[]>(`/api/models/${model.id}/history`));
@@ -2675,7 +3276,7 @@ function ModelDrawer({
   useEffect(() => {
     if (model.id) {
       refreshHistory();
-      api<RunRecord[]>(`/api/models/${model.id}/runs`).then(setRuns);
+      api<RunRecord[]>(`/api/models/${model.id}/runs?days=30`).then(setRuns);
     }
   }, [model.id]);
   const updateInput = (i: number, next: Parameter) =>
@@ -2815,6 +3416,7 @@ function ModelDrawer({
         body: JSON.stringify({ employeeId: employeeId.trim() }),
       });
       await onChanged();
+      await refreshHistory();
     } catch (reason) {
       setActionError((reason as Error).message);
     } finally {
@@ -2822,19 +3424,52 @@ function ModelDrawer({
     }
   };
   const deleteFamily = async () => {
-    if (
-      !window.confirm(
-        `Delete the entire ${model.name} model family, including all revisions and adaptive state?`,
-      )
-    )
-      return;
     setBusy(true);
     setActionError('');
     try {
-      await api(`/api/models/${model.id}`, { method: 'DELETE' });
+      const summary = await api<{
+        familyId: string;
+        modelName: string;
+        revisionCount: number;
+        runCount: number;
+      }>(`/api/models/${model.id}/purge-summary`);
+      if (summary.runCount === 0) {
+        if (
+          !window.confirm(
+            `Delete ${summary.modelName}? This removes ${summary.revisionCount} revision(s) and its adaptive state.`,
+          )
+        ) return;
+        await api(`/api/models/${model.id}`, { method: 'DELETE' });
+      } else {
+        const typed = window.prompt(
+          `IRREVERSIBLE PURGE\n\nThis will delete ${summary.revisionCount} revision(s) and ${summary.runCount} run(s), including their parameter values, outputs, data samples, feedback, and adaptive state. Temporal and audit history remain.\n\nType the model name exactly to continue:\n${summary.modelName}`,
+        );
+        if (typed === null) return;
+        if (typed !== summary.modelName) {
+          setActionError('The typed model name did not match. Nothing was deleted.');
+          return;
+        }
+        await api(`/api/models/${model.id}/purge`, {
+          method: 'DELETE',
+          body: JSON.stringify({ modelName: typed }),
+        });
+      }
       await onChanged();
-    } catch (e) {
-      setActionError((e as Error).message);
+    } catch (reason) {
+      setActionError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const retireFamily = async () => {
+    if (!window.confirm(`Retire ${model.name}? It will no longer be selected for new production runs.`)) return;
+    setBusy(true);
+    setActionError('');
+    try {
+      await api(`/api/models/${model.id}/retire`, { method: 'POST' });
+      await onChanged();
+    } catch (reason) {
+      setActionError((reason as Error).message);
     } finally {
       setBusy(false);
     }
@@ -2871,10 +3506,18 @@ function ModelDrawer({
                 </button>
               )}
               {role === 'admin' && (
-                <button className="danger model-action" disabled={busy} onClick={deleteFamily}>
-                  <Trash2 />
-                  Delete model
-                </button>
+                <>
+                  {activeRevision && (
+                    <button className="secondary model-action" disabled={busy} onClick={retireFamily}>
+                      <FileClock />
+                      Retire model
+                    </button>
+                  )}
+                  <button className="danger model-action" disabled={busy} onClick={deleteFamily}>
+                    <Trash2 />
+                    Delete model
+                  </button>
+                </>
               )}
             </div>
             <div className="model-detail-tools">
@@ -2896,7 +3539,7 @@ function ModelDrawer({
                   onClick={() => setShowHistoryChart(true)}
                 >
                   <Activity />
-                  View 14-day run chart
+                  View run trend chart
                 </button>
               )}
               {model.dataSamples?.length > 0 && (
@@ -2956,8 +3599,9 @@ function ModelDrawer({
                     </div>
                     <p>{item.changeNote}</p>
                     <small>
-                      {item.createdBy} · {formatDate(item.createdAt)}
+                      Created by {displayNameFor(item.createdBy)} · {formatDate(item.createdAt)}
                     </small>
+                    <small>Owner: {displayNameFor(item.owner || item.createdBy)}</small>
                     {item.submittedAt && (
                       <small>
                         Submitted by {item.submittedBy} · {formatDate(item.submittedAt)}
@@ -3126,7 +3770,7 @@ function ModelDrawer({
       )}
       {showHistoryChart && (
         <ChartSeriesDialog
-          title={`${model.name} · Last 14 days`}
+          title={`${model.name} · Run history`}
           options={historyChartSeries}
           onClose={() => setShowHistoryChart(false)}
         />
@@ -3210,19 +3854,14 @@ function exampleValue(type?: string) {
 
 function modelRequest(model: Model) {
   return {
-    runId: 'RUN_UNIQUE_ID',
-    context: {
-      ...Object.fromEntries(
-        Object.entries(model.indexes).map(([key, values]) => [key, values[0] || 'VALUE']),
-      ),
-      ...Object.fromEntries(
-        (model.externalInputs || []).map((input) => [input.name, exampleValue(input.type)]),
-      ),
-    },
-    parameterValues: Object.fromEntries(
-      model.parameters
-        .filter((parameter) => parameter.source === 'sql')
-        .map((parameter) => [parameter.key, exampleValue(parameter.dataType || 'number')]),
+    indexes: Object.fromEntries(
+      Object.entries(model.indexes).map(([key, values]) => [
+        key,
+        values[0] === '*' ? 'VALUE' : values[0] || 'VALUE',
+      ]),
+    ),
+    externalInputs: Object.fromEntries(
+      (model.externalInputs || []).map((input) => [input.name, exampleValue(input.type)]),
     ),
   };
 }
@@ -3237,7 +3876,7 @@ function modelContractPayload(model: Model) {
     indexes: Object.entries(model.indexes).map(([name, values]) => ({
       name,
       type: 'string',
-      required: true,
+      required: ['machine', 'action', 'material'].includes(name.toLowerCase()),
       acceptedValues: values,
     })),
     externalInputs: (model.externalInputs || []).map((input) => ({
@@ -3246,14 +3885,6 @@ function modelContractPayload(model: Model) {
       required: true,
       description: input.description || '',
     })),
-    optionalParameterOverrides: model.parameters
-      .filter((parameter) => parameter.source === 'sql')
-      .map((parameter) => ({
-        name: parameter.key,
-        type: parameter.dataType || 'number',
-        required: false,
-        description: parameter.description || '',
-      })),
     outputs: model.outputs.map((name) => ({
       name,
       type: definitions.get(name)?.dataType || 'number',

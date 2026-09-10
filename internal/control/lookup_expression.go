@@ -10,6 +10,7 @@ import (
 )
 
 var lookupBooleanWord = regexp.MustCompile(`(?i)\s+(AND|OR)\s+`)
+var lookupColumnReference = regexp.MustCompile(`@([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)`)
 var lookupReference = regexp.MustCompile(`@([A-Za-z_][A-Za-z0-9_]*)`)
 
 func parseLookupExpression(expression string) (*ast.CallExpr, string, error) {
@@ -19,6 +20,7 @@ func parseLookupExpression(expression string) (*ast.CallExpr, string, error) {
 		}
 		return " || "
 	})
+	normalized = lookupColumnReference.ReplaceAllString(normalized, "colref__${1}__${2}")
 	normalized = lookupReference.ReplaceAllString(normalized, "ref__$1")
 	node, err := parser.ParseExpr(normalized)
 	if err != nil {
@@ -98,31 +100,31 @@ func ValidateLookupFormula(expression, expectedResultType string, definitions []
 	if returnType != expectedResultType {
 		return fmt.Errorf("lookup return column %s is %s, but parameter result is %s", returnName, returnType, expectedResultType)
 	}
-	if err := validateLookupFilter(call.Args[1], columnTypes, referenceTypes, indexes); err != nil {
+	if err := validateLookupFilter(call.Args[1], sampleName, columnTypes, referenceTypes, indexes); err != nil {
 		return fmt.Errorf("lookup filter: %w", err)
 	}
 	return nil
 }
 
-func validateLookupFilter(node ast.Expr, columns, references map[string]string, indexes map[string]IndexValues) error {
+func validateLookupFilter(node ast.Expr, sampleName string, columns, references map[string]string, indexes map[string]IndexValues) error {
 	if parenthesized, ok := node.(*ast.ParenExpr); ok {
-		return validateLookupFilter(parenthesized.X, columns, references, indexes)
+		return validateLookupFilter(parenthesized.X, sampleName, columns, references, indexes)
 	}
 	if call, ok := node.(*ast.CallExpr); ok {
 		function, _ := call.Fun.(*ast.Ident)
-		if function == nil || !strings.EqualFold(function.Name, "CONTAINS") || len(call.Args) != 2 {
+		if function == nil || (!strings.EqualFold(function.Name, "CONTAINS") && !strings.EqualFold(function.Name, "MATCHES")) || len(call.Args) != 2 {
 			return fmt.Errorf("filter must use comparisons joined by AND or OR")
 		}
-		left, err := lookupValueType(call.Args[0], columns, references, indexes)
+		left, err := lookupValueType(call.Args[0], sampleName, columns, references, indexes)
 		if err != nil {
 			return err
 		}
-		right, err := lookupValueType(call.Args[1], columns, references, indexes)
+		right, err := lookupValueType(call.Args[1], sampleName, columns, references, indexes)
 		if err != nil {
 			return err
 		}
 		if left != "string" || right != "string" {
-			return fmt.Errorf("CONTAINS requires text operands, got %s and %s", typeLabel(left), typeLabel(right))
+			return fmt.Errorf("%s requires text operands, got %s and %s", strings.ToUpper(function.Name), typeLabel(left), typeLabel(right))
 		}
 		return nil
 	}
@@ -131,16 +133,16 @@ func validateLookupFilter(node ast.Expr, columns, references map[string]string, 
 		return fmt.Errorf("filter must use comparisons joined by AND or OR")
 	}
 	if binary.Op == token.LAND || binary.Op == token.LOR {
-		if err := validateLookupFilter(binary.X, columns, references, indexes); err != nil {
+		if err := validateLookupFilter(binary.X, sampleName, columns, references, indexes); err != nil {
 			return err
 		}
-		return validateLookupFilter(binary.Y, columns, references, indexes)
+		return validateLookupFilter(binary.Y, sampleName, columns, references, indexes)
 	}
-	left, err := lookupValueType(binary.X, columns, references, indexes)
+	left, err := lookupValueType(binary.X, sampleName, columns, references, indexes)
 	if err != nil {
 		return err
 	}
-	right, err := lookupValueType(binary.Y, columns, references, indexes)
+	right, err := lookupValueType(binary.Y, sampleName, columns, references, indexes)
 	if err != nil {
 		return err
 	}
@@ -159,12 +161,22 @@ func validateLookupFilter(node ast.Expr, columns, references map[string]string, 
 	return nil
 }
 
-func lookupValueType(node ast.Expr, columns, references map[string]string, indexes map[string]IndexValues) (string, error) {
+func lookupValueType(node ast.Expr, sampleName string, columns, references map[string]string, indexes map[string]IndexValues) (string, error) {
 	if parenthesized, ok := node.(*ast.ParenExpr); ok {
-		return lookupValueType(parenthesized.X, columns, references, indexes)
+		return lookupValueType(parenthesized.X, sampleName, columns, references, indexes)
 	}
 	switch value := node.(type) {
 	case *ast.Ident:
+		if strings.HasPrefix(value.Name, "colref__") {
+			referencedSample, column, ok := lookupColumnName(value)
+			if !ok || !strings.EqualFold(referencedSample, sampleName) {
+				return "", fmt.Errorf("lookup columns must reference @%s.column", sampleName)
+			}
+			if dataType, exists := columns[strings.ToLower(column)]; exists {
+				return dataType, nil
+			}
+			return "", fmt.Errorf("data sample %s has no column %q", sampleName, column)
+		}
 		if strings.HasPrefix(value.Name, "ref__") {
 			name := strings.TrimPrefix(value.Name, "ref__")
 			if dataType, exists := references[name]; exists {
@@ -178,10 +190,7 @@ func lookupValueType(node ast.Expr, columns, references map[string]string, index
 		if strings.EqualFold(value.Name, "true") || strings.EqualFold(value.Name, "false") {
 			return "boolean", nil
 		}
-		if dataType, exists := columns[strings.ToLower(value.Name)]; exists {
-			return dataType, nil
-		}
-		return "", fmt.Errorf("unknown column %q", value.Name)
+		return "", fmt.Errorf("column %q must be referenced as @%s.%s", value.Name, sampleName, value.Name)
 	case *ast.BasicLit:
 		if value.Kind == token.STRING {
 			return "string", nil
@@ -274,7 +283,7 @@ func EvaluateLookupFormula(expression, resultType string, definitions []DataSamp
 		}
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("lookup found no matching row in data sample %s", sampleName)
+		return nil, nil
 	}
 	if mode == "LOOKUP_ONE" && len(matches) != 1 {
 		return nil, fmt.Errorf("lookup found %d matching rows in data sample %s", len(matches), sampleName)
@@ -299,9 +308,25 @@ func lookupNames(call *ast.CallExpr) (string, string, error) {
 	sample, sampleOK := call.Args[0].(*ast.Ident)
 	result, resultOK := call.Args[2].(*ast.Ident)
 	if !sampleOK || !resultOK {
-		return "", "", fmt.Errorf("lookup sample and return column must be names")
+		return "", "", fmt.Errorf("lookup sample and return column must use @sample and @sample.column")
 	}
-	return strings.TrimPrefix(sample.Name, "ref__"), result.Name, nil
+	sampleName := strings.TrimPrefix(sample.Name, "ref__")
+	returnSample, returnName, ok := lookupColumnName(result)
+	if !strings.HasPrefix(sample.Name, "ref__") || !ok || !strings.EqualFold(sampleName, returnSample) {
+		return "", "", fmt.Errorf("lookup return column must use @%s.column", sampleName)
+	}
+	return sampleName, returnName, nil
+}
+
+func lookupColumnName(identifier *ast.Ident) (string, string, bool) {
+	if identifier == nil || !strings.HasPrefix(identifier.Name, "colref__") {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(identifier.Name, "colref__"), "__", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func findSampleDefinition(name string, definitions []DataSampleDefinition) *DataSampleDefinition {
@@ -319,7 +344,7 @@ func evalLookupFilter(node ast.Expr, row map[string]interface{}, columns map[str
 		call, callOK := node.(*ast.CallExpr)
 		if callOK {
 			function, _ := call.Fun.(*ast.Ident)
-			if function != nil && strings.EqualFold(function.Name, "CONTAINS") && len(call.Args) == 2 {
+			if function != nil && (strings.EqualFold(function.Name, "CONTAINS") || strings.EqualFold(function.Name, "MATCHES")) && len(call.Args) == 2 {
 				left, leftErr := lookupValue(call.Args[0], row, columns, context, values)
 				right, rightErr := lookupValue(call.Args[1], row, columns, context, values)
 				if leftErr != nil {
@@ -328,7 +353,17 @@ func evalLookupFilter(node ast.Expr, row map[string]interface{}, columns map[str
 				if rightErr != nil {
 					return false, rightErr
 				}
-				return strings.Contains(strings.ToLower(stringValue(left)), strings.ToLower(stringValue(right))), nil
+				if left == nil || right == nil {
+					return false, nil
+				}
+				if strings.EqualFold(function.Name, "CONTAINS") {
+					return strings.EqualFold(stringValue(left), stringValue(right)), nil
+				}
+				pattern, patternErr := regexp.Compile(stringValue(right))
+				if patternErr != nil {
+					return false, fmt.Errorf("MATCHES pattern is invalid: %w", patternErr)
+				}
+				return pattern.MatchString(stringValue(left)), nil
 			}
 		}
 		return false, fmt.Errorf("lookup filter must use comparisons joined by AND or OR")
@@ -355,6 +390,9 @@ func evalLookupFilter(node ast.Expr, row map[string]interface{}, columns map[str
 	if err != nil {
 		return false, err
 	}
+	if left == nil || right == nil {
+		return false, nil
+	}
 	switch binary.Op {
 	case token.EQL:
 		return compareLogicValue(left, "equals", right)
@@ -376,6 +414,17 @@ func evalLookupFilter(node ast.Expr, row map[string]interface{}, columns map[str
 func lookupValue(node ast.Expr, row map[string]interface{}, columns map[string]string, context, values map[string]interface{}) (interface{}, error) {
 	switch value := node.(type) {
 	case *ast.Ident:
+		if strings.HasPrefix(value.Name, "colref__") {
+			_, column, ok := lookupColumnName(value)
+			if !ok {
+				return nil, fmt.Errorf("invalid lookup column reference")
+			}
+			name, exists := columns[strings.ToLower(column)]
+			if !exists {
+				return nil, fmt.Errorf("unknown lookup column %q", column)
+			}
+			return row[name], nil
+		}
 		if strings.HasPrefix(value.Name, "ref__") {
 			name := strings.TrimPrefix(value.Name, "ref__")
 			if resolved, exists := values[name]; exists {
@@ -392,11 +441,7 @@ func lookupValue(node ast.Expr, row map[string]interface{}, columns map[string]s
 		if strings.EqualFold(value.Name, "false") {
 			return false, nil
 		}
-		name, exists := columns[strings.ToLower(value.Name)]
-		if !exists {
-			return nil, fmt.Errorf("unknown lookup column %q", value.Name)
-		}
-		return row[name], nil
+		return nil, fmt.Errorf("lookup column %q must use @sample.%s", value.Name, value.Name)
 	case *ast.BasicLit:
 		if value.Kind == token.STRING {
 			return strings.Trim(value.Value, `"`), nil

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,11 +42,12 @@ type InputDefinition struct {
 	System      bool   `json:"system,omitempty"`
 }
 type UserRegistration struct {
-	EmployeeID string `json:"employeeId"`
-	LoginID    string `json:"loginId"`
-	Email      string `json:"email,omitempty"`
-	Role       string `json:"role"`
-	Status     string `json:"status"`
+	EmployeeID  string `json:"employeeId"`
+	LoginID     string `json:"loginId"`
+	DisplayName string `json:"displayName,omitempty"`
+	Email       string `json:"email,omitempty"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
 }
 type Config struct {
 	Sources          []Source                 `json:"sources"`
@@ -57,6 +59,13 @@ type Config struct {
 	NextRunSequence  int64                    `json:"nextRunSequence,omitempty"`
 }
 
+type ModelPurgeSummary struct {
+	FamilyID      string `json:"familyId"`
+	ModelName     string `json:"modelName"`
+	RevisionCount int    `json:"revisionCount"`
+	RunCount      int    `json:"runCount"`
+}
+
 func (s *Store) UserRegistrations() []UserRegistration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -66,6 +75,10 @@ func (s *Store) UserRegistrations() []UserRegistration {
 func (s *Store) UpsertUserRegistration(next UserRegistration) (UserRegistration, error) {
 	next.EmployeeID = strings.TrimSpace(next.EmployeeID)
 	next.LoginID = strings.TrimSpace(next.LoginID)
+	next.DisplayName = strings.TrimSpace(next.DisplayName)
+	if next.DisplayName == "" {
+		next.DisplayName = next.LoginID
+	}
 	if next.Status == "" {
 		next.Status = "active"
 	}
@@ -76,13 +89,13 @@ func (s *Store) UpsertUserRegistration(next UserRegistration) (UserRegistration,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index, existing := range s.config.Users {
-		if strings.EqualFold(existing.EmployeeID, next.EmployeeID) {
+		if strings.EqualFold(strings.TrimSpace(existing.EmployeeID), next.EmployeeID) {
 			s.config.Users[index] = next
-			return next, s.persist()
+			return next, s.persistUser(next)
 		}
 	}
 	s.config.Users = append(s.config.Users, next)
-	return next, s.persist()
+	return next, s.persistUser(next)
 }
 
 func (s *Store) DeleteUserRegistration(employeeID string) error {
@@ -90,7 +103,10 @@ func (s *Store) DeleteUserRegistration(employeeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index, existing := range s.config.Users {
-		if strings.EqualFold(existing.EmployeeID, employeeID) {
+		if strings.EqualFold(strings.TrimSpace(existing.EmployeeID), employeeID) {
+			if err := s.deleteSQL("USERS", "EMPLOYEE_ID", employeeID); err != nil {
+				return err
+			}
 			s.config.Users = append(s.config.Users[:index], s.config.Users[index+1:]...)
 			return s.persist()
 		}
@@ -113,7 +129,7 @@ func (s *Store) TransferDraftOwner(modelID, employeeID string) (control.Model, e
 			return control.Model{}, errors.New("only draft revisions can be transferred")
 		}
 		s.config.Models[index].Owner = employeeID
-		if err := s.persist(); err != nil {
+		if err := s.persistModels(s.config.Models[index]); err != nil {
 			return control.Model{}, err
 		}
 		return s.config.Models[index], nil
@@ -122,19 +138,21 @@ func (s *Store) TransferDraftOwner(modelID, employeeID string) (control.Model, e
 }
 
 type RunRecord struct {
-	RunID           string                 `json:"runId"`
-	FamilyID        string                 `json:"familyId"`
-	ModelID         string                 `json:"modelId"`
-	ModelRevision   int                    `json:"modelRevision"`
-	Sequence        int64                  `json:"sequence"`
-	Status          string                 `json:"status"`
-	PreparedAt      string                 `json:"preparedAt"`
-	CompletedAt     string                 `json:"completedAt,omitempty"`
-	Context         map[string]interface{} `json:"context"`
-	Parameters      map[string]interface{} `json:"parameters"`
-	Outputs         []control.OutputValue  `json:"outputs"`
-	Feedback        map[string]interface{} `json:"feedback,omitempty"`
-	AdaptiveUpdates map[string]float64     `json:"adaptiveUpdates,omitempty"`
+	RunID           string                              `json:"runId"`
+	FamilyID        string                              `json:"familyId"`
+	ModelID         string                              `json:"modelId"`
+	ModelRevision   int                                 `json:"modelRevision"`
+	Sequence        int64                               `json:"sequence"`
+	Status          string                              `json:"status"`
+	PreparedAt      string                              `json:"preparedAt"`
+	CompletedAt     string                              `json:"completedAt,omitempty"`
+	Context         map[string]interface{}              `json:"context"`
+	Parameters      map[string]interface{}              `json:"parameters"`
+	Outputs         []control.OutputValue               `json:"outputs"`
+	Feedback        map[string]interface{}              `json:"feedback,omitempty"`
+	AdaptiveUpdates map[string]float64                  `json:"adaptiveUpdates,omitempty"`
+	DataSamples     map[string][]map[string]interface{} `json:"dataSamples,omitempty"`
+	Disposition     string                              `json:"disposition,omitempty"`
 }
 type AdaptiveState struct {
 	Value        float64 `json:"value"`
@@ -145,6 +163,7 @@ type AdaptiveState struct {
 type Store struct {
 	mu     sync.RWMutex
 	path   string
+	db     *sql.DB
 	config Config
 }
 
@@ -224,7 +243,7 @@ func (s *Store) CreateInputDefinition(next InputDefinition) (InputDefinition, er
 		}
 	}
 	s.config.InputDefinitions = append(s.config.InputDefinitions, next)
-	if err := s.persist(); err != nil {
+	if err := s.persistInput(next); err != nil {
 		return InputDefinition{}, err
 	}
 	return next, nil
@@ -242,7 +261,7 @@ func (s *Store) UpdateInputDefinition(name string, next InputDefinition) (InputD
 				return InputDefinition{}, err
 			}
 			s.config.InputDefinitions[index] = next
-			if err := s.persist(); err != nil {
+			if err := s.persistInput(next); err != nil {
 				return InputDefinition{}, err
 			}
 			return next, nil
@@ -281,6 +300,9 @@ func (s *Store) DeleteInputDefinition(name string) error {
 				return fmt.Errorf("input definition %s is referenced by model %s revision %d", name, model.Name, model.Revision)
 			}
 		}
+	}
+	if err := s.deleteSQL("INPUT_DEFINITIONS", "INPUT_NAME", name); err != nil {
+		return err
 	}
 	s.config.InputDefinitions = append(s.config.InputDefinitions[:definitionIndex], s.config.InputDefinitions[definitionIndex+1:]...)
 	return s.persist()
@@ -345,7 +367,7 @@ func (s *Store) RecordRun(record RunRecord) error {
 		}
 	}
 	s.config.Runs = append(s.config.Runs, record)
-	return s.persist()
+	return s.persistRun(record)
 }
 func (s *Store) RecordPreparedRun(record RunRecord, model control.Model, adaptiveUpdates map[string]float64) (int64, error) {
 	s.mu.Lock()
@@ -356,21 +378,20 @@ func (s *Store) RecordPreparedRun(record RunRecord, model control.Model, adaptiv
 		}
 	}
 	limit := model.ExecutionPolicy.MaxUnfinishedRuns
-	if limit == 0 {
-		limit = 1
-	}
-	partition := executionPartitionKey(model, record.Context)
-	unfinished := 0
-	for _, existing := range s.config.Runs {
-		if existing.FamilyID != model.FamilyID || existing.Status != "prepared" {
-			continue
+	if limit > 0 {
+		partition := executionPartitionKey(model, record.Context)
+		unfinished := 0
+		for _, existing := range s.config.Runs {
+			if existing.FamilyID != model.FamilyID || existing.Status != "prepared" {
+				continue
+			}
+			if partition == executionPartitionKey(model, existing.Context) {
+				unfinished++
+			}
 		}
-		if partition == executionPartitionKey(model, existing.Context) {
-			unfinished++
+		if unfinished >= limit {
+			return 0, fmt.Errorf("maximum unfinished runs reached for this partition (%d)", limit)
 		}
-	}
-	if unfinished >= limit {
-		return 0, fmt.Errorf("maximum unfinished runs reached for this partition (%d)", limit)
 	}
 	s.config.NextRunSequence++
 	record.Sequence = s.config.NextRunSequence
@@ -391,7 +412,7 @@ func (s *Store) RecordPreparedRun(record RunRecord, model control.Model, adaptiv
 		}
 	}
 	s.config.Runs = append(s.config.Runs, record)
-	return record.Sequence, s.persist()
+	return record.Sequence, s.persistRun(record)
 }
 func (s *Store) Run(id string) (RunRecord, bool) {
 	s.mu.RLock()
@@ -427,7 +448,7 @@ func (s *Store) CompleteRun(id, status string, feedback map[string]interface{}, 
 			s.config.Runs[index].Feedback = feedback
 			s.config.Runs[index].CompletedAt = time.Now().UTC().Format(time.RFC3339)
 			s.config.Runs[index].AdaptiveUpdates = updates
-			return s.persist()
+			return s.persistRun(s.config.Runs[index])
 		}
 	}
 	return errors.New("prepared run not found")
@@ -496,7 +517,7 @@ func (s *Store) CompleteRunWithFeedbackAdaptive(id string, model control.Model, 
 	record.Feedback = feedback
 	record.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	record.AdaptiveUpdates = applied
-	return applied, ignored, s.persist()
+	return applied, ignored, s.persistRun(*record)
 }
 func (s *Store) RunsForFamily(familyID string, since time.Time) []RunRecord {
 	s.mu.RLock()
@@ -573,9 +594,17 @@ func (s *Store) CommitAdaptive(model control.Model, context map[string]interface
 		}
 		s.config.AdaptiveStates[key] = AdaptiveState{Value: value, LastRunID: runID, UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
 	}
+	// Immediate executions persist the run and its adaptive updates together in
+	// RecordRun so LAST_RUN_ID always references an existing PCS.RUNS row.
+	if s.db != nil {
+		return nil
+	}
 	return s.persist()
 }
 func (s *Store) persist() error {
+	if s.db != nil {
+		return nil
+	}
 	data, err := json.MarshalIndent(s.config, "", "  ")
 	if err != nil {
 		return err
@@ -609,7 +638,7 @@ func (s *Store) UpdateSource(id string, next Source) (Source, error) {
 		next.LastTestMS = s.config.Sources[index].LastTestMS
 		next.Location = fmt.Sprintf("%s:%d/%s", next.Host, next.Port, next.Database)
 		s.config.Sources[index] = next
-		return next, s.persist()
+		return next, s.persistSource(next)
 	}
 	return Source{}, errors.New("data source not found")
 }
@@ -633,7 +662,7 @@ func (s *Store) CreateSource(next Source) (Source, error) {
 		return Source{}, err
 	}
 	s.config.Sources = append(s.config.Sources, next)
-	if err := s.persist(); err != nil {
+	if err := s.persistSource(next); err != nil {
 		return Source{}, err
 	}
 	return next, nil
@@ -682,7 +711,7 @@ func (s *Store) RecordSourceTest(id, status, message string, elapsedMS int64) (S
 		s.config.Sources[index].LastTestMessage = message
 		s.config.Sources[index].LastTestAt = time.Now().UTC().Format(time.RFC3339)
 		s.config.Sources[index].LastTestMS = elapsedMS
-		return s.config.Sources[index], s.persist()
+		return s.config.Sources[index], s.persistSource(s.config.Sources[index])
 	}
 	return Source{}, errors.New("data source not found")
 }
@@ -723,7 +752,7 @@ func (s *Store) CreateModel(model control.Model) (control.Model, error) {
 		return control.Model{}, err
 	}
 	s.config.Models = append(s.config.Models, model)
-	return model, s.persist()
+	return model, s.persistModels(model)
 }
 
 func modelFamilyID(name string) string {
@@ -796,7 +825,7 @@ func (s *Store) CreateRevision(baseID string, next control.Model) (control.Model
 		return control.Model{}, err
 	}
 	s.config.Models = append(s.config.Models, next)
-	return next, s.persist()
+	return next, s.persistModels(next)
 }
 
 func (s *Store) DeleteRevision(id string) error {
@@ -808,6 +837,9 @@ func (s *Store) DeleteRevision(id string) error {
 		}
 		if model.Status != "draft" {
 			return errors.New("only draft revisions can be deleted")
+		}
+		if err := s.deleteSQL("MODEL_REVISIONS", "MODEL_ID", id); err != nil {
+			return err
 		}
 		s.config.Models = append(s.config.Models[:index], s.config.Models[index+1:]...)
 		return s.persist()
@@ -847,7 +879,7 @@ func (s *Store) UpdateDraft(id string, next control.Model) (control.Model, error
 			return control.Model{}, err
 		}
 		s.config.Models[index] = next
-		return next, s.persist()
+		return next, s.persistModels(next)
 	}
 	return control.Model{}, errors.New("draft revision not found")
 }
@@ -865,6 +897,14 @@ func (s *Store) DeleteFamily(id string) error {
 	if familyID == "" {
 		return errors.New("model not found")
 	}
+	for _, run := range s.config.Runs {
+		if run.FamilyID == familyID {
+			return errors.New("this model has execution history and cannot be permanently deleted")
+		}
+	}
+	if err := s.deleteSQL("MODEL_FAMILIES", "FAMILY_ID", familyID); err != nil {
+		return err
+	}
 	kept := s.config.Models[:0]
 	for _, model := range s.config.Models {
 		if model.FamilyID != familyID {
@@ -878,6 +918,122 @@ func (s *Store) DeleteFamily(id string) error {
 		}
 	}
 	return s.persist()
+}
+
+func (s *Store) RetireFamily(id string) (control.Model, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	familyID := ""
+	for _, model := range s.config.Models {
+		if model.ID == id {
+			familyID = model.FamilyID
+			break
+		}
+	}
+	if familyID == "" {
+		return control.Model{}, errors.New("model not found")
+	}
+	changed := []control.Model{}
+	var retired control.Model
+	for index := range s.config.Models {
+		model := &s.config.Models[index]
+		if model.FamilyID == familyID && model.Status == "approved" && model.Enabled {
+			model.Enabled = false
+			retired = *model
+			changed = append(changed, *model)
+		}
+	}
+	if len(changed) == 0 {
+		return control.Model{}, errors.New("model is already retired")
+	}
+	if err := s.persistModels(changed...); err != nil {
+		return control.Model{}, err
+	}
+	return retired, nil
+}
+
+func (s *Store) ModelPurgeSummary(id string) (ModelPurgeSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	summary := ModelPurgeSummary{}
+	for _, model := range s.config.Models {
+		if model.ID == id {
+			summary.FamilyID = model.FamilyID
+			summary.ModelName = model.Name
+			break
+		}
+	}
+	if summary.FamilyID == "" {
+		return summary, errors.New("model not found")
+	}
+	if s.db != nil {
+		return s.modelPurgeSummarySQL(summary)
+	}
+	for _, model := range s.config.Models {
+		if model.FamilyID == summary.FamilyID {
+			summary.RevisionCount++
+		}
+	}
+	for _, run := range s.config.Runs {
+		if run.FamilyID == summary.FamilyID {
+			summary.RunCount++
+		}
+	}
+	return summary, nil
+}
+
+func (s *Store) PurgeFamily(id string) (ModelPurgeSummary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	summary := ModelPurgeSummary{}
+	for _, model := range s.config.Models {
+		if model.ID == id {
+			summary.FamilyID = model.FamilyID
+			summary.ModelName = model.Name
+			break
+		}
+	}
+	if summary.FamilyID == "" {
+		return summary, errors.New("model not found")
+	}
+	var err error
+	if s.db != nil {
+		summary, err = s.purgeFamilySQL(summary)
+		if err != nil {
+			return summary, err
+		}
+	} else {
+		for _, model := range s.config.Models {
+			if model.FamilyID == summary.FamilyID {
+				summary.RevisionCount++
+			}
+		}
+		for _, run := range s.config.Runs {
+			if run.FamilyID == summary.FamilyID {
+				summary.RunCount++
+			}
+		}
+	}
+	models := s.config.Models[:0]
+	for _, model := range s.config.Models {
+		if model.FamilyID != summary.FamilyID {
+			models = append(models, model)
+		}
+	}
+	s.config.Models = models
+	runs := s.config.Runs[:0]
+	for _, run := range s.config.Runs {
+		if run.FamilyID != summary.FamilyID {
+			runs = append(runs, run)
+		}
+	}
+	s.config.Runs = runs
+	for key := range s.config.AdaptiveStates {
+		if strings.HasPrefix(key, summary.FamilyID+"|") {
+			delete(s.config.AdaptiveStates, key)
+		}
+	}
+	return summary, s.persist()
 }
 func (s *Store) SubmitForApproval(id, actor string) (control.Model, error) {
 	s.mu.Lock()
@@ -905,7 +1061,7 @@ func (s *Store) SubmitForApproval(id, actor string) (control.Model, error) {
 		s.config.Models[index].RejectedBy = ""
 		s.config.Models[index].RejectedAt = ""
 		s.config.Models[index].RejectionReason = ""
-		if err := s.persist(); err != nil {
+		if err := s.persistModels(s.config.Models[index]); err != nil {
 			return control.Model{}, err
 		}
 		return s.config.Models[index], nil
@@ -932,7 +1088,7 @@ func (s *Store) Reject(id, actor, reason string) (control.Model, error) {
 		s.config.Models[index].RejectedBy = actor
 		s.config.Models[index].RejectedAt = time.Now().UTC().Format(time.RFC3339)
 		s.config.Models[index].RejectionReason = reason
-		if err := s.persist(); err != nil {
+		if err := s.persistModels(s.config.Models[index]); err != nil {
 			return control.Model{}, err
 		}
 		return s.config.Models[index], nil
@@ -965,17 +1121,20 @@ func (s *Store) Approve(id, actor string, allowSelfApproval bool) (control.Model
 			return control.Model{}, fmt.Errorf("cannot approve: routing overlaps equally with active model %q", existing.Name)
 		}
 	}
+	changed := []control.Model{}
 	for i := range s.config.Models {
 		if s.config.Models[i].FamilyID == target.FamilyID && s.config.Models[i].Status == "approved" {
 			s.config.Models[i].Status = "superseded"
 			s.config.Models[i].Enabled = false
+			changed = append(changed, s.config.Models[i])
 		}
 	}
 	s.config.Models[index].Status = "approved"
 	s.config.Models[index].Enabled = true
 	s.config.Models[index].ApprovedBy = actor
 	s.config.Models[index].ApprovedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := s.persist(); err != nil {
+	changed = append(changed, s.config.Models[index])
+	if err := s.persistModels(changed...); err != nil {
 		return control.Model{}, err
 	}
 	return s.config.Models[index], nil
