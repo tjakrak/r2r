@@ -677,6 +677,10 @@ for (const name of ['ABS', 'CEIL', 'COS', 'EXP', 'FLOOR', 'LOG', 'ROUND', 'SIN',
     description: `Applies the ${name.toLowerCase()} mathematical function.`,
   };
 }
+functionHelp.ROUND = {
+  signature: 'ROUND(@value, decimal_places)',
+  description: 'Rounds a number to the optional whole-number decimal place from -15 to 15. Without it, rounds to an integer.',
+};
 Object.assign(functionHelp, {
   POW: { signature: 'POW(@value, exponent)', description: 'Raises a number to an exponent.' },
   SUBSTR: { signature: 'SUBSTR(@text, start, length)', description: 'Returns part of a text value.' },
@@ -856,7 +860,7 @@ const expressionGroups = [
       ['Floor', 'FLOOR(@value)'],
       ['Natural log', 'LOG(@value)'],
       ['Power', 'POW(@value, exponent)'],
-      ['Round', 'ROUND(@value)'],
+      ['Round', 'ROUND(@value, decimal_places)'],
       ['Sine', 'SIN(@value)'],
       ['Square root', 'SQRT(@value)'],
       ['Tangent', 'TAN(@value)'],
@@ -4978,7 +4982,7 @@ function ParameterSourceEditor({
               { name: 'FLOOR(@value)', source: 'Math function', plain: true },
               { name: 'LOG(@value)', source: 'Math function', plain: true },
               { name: 'POW(@value, exponent)', source: 'Math function', plain: true },
-              { name: 'ROUND(@value)', source: 'Math function', plain: true },
+              { name: 'ROUND(@value, decimal_places)', source: 'Math function', plain: true },
               { name: 'SIN(@value)', source: 'Math function', plain: true },
               { name: 'SQRT(@value)', source: 'Math function', plain: true },
               { name: 'TAN(@value)', source: 'Math function', plain: true },

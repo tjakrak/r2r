@@ -1,0 +1,402 @@
+{
+  "name": "B5 RIE802 Recipe Selection",
+  "description": "Selects the B5 RIE802 recipe for BPI190, CMS190, or CLU200 using wafer history and the approved workbook thresholds.",
+  "changeNote": "Initial R2R conversion of RIE_no_macro.xlsx and RIE_macro.txt",
+  "indexes": {
+    "machine": [
+      "B5_RIE802"
+    ],
+    "action": [
+      "RECIPE_SELECTION"
+    ],
+    "material": [
+      "WAFER"
+    ]
+  },
+  "externalInputs": [
+    {
+      "name": "wafer_id",
+      "description": "Wafer identifier supplied by the external application and matched to ContainerName.",
+      "type": "string"
+    },
+    {
+      "name": "operation",
+      "description": "Current operation. Supported values are BPI190, CMS190, and CLU200.",
+      "type": "string"
+    },
+    {
+      "name": "product",
+      "description": "Product number supplied by the external application.",
+      "type": "string"
+    }
+  ],
+  "feedbackInputs": [],
+  "executionPolicy": {
+    "maxUnfinishedRuns": 1,
+    "partitionBy": [
+      "wafer_id"
+    ]
+  },
+  "parameters": [
+    {
+      "key": "validated_operation",
+      "description": "Validated current operation.",
+      "unit": "",
+      "dataType": "string",
+      "source": "expression",
+      "definition": "LOOKUP_ONE(@supported_operations, @supported_operations.operation == @operation, @supported_operations.operation)"
+    },
+    {
+      "key": "product_group",
+      "description": "Recipe product group mapped from the supplied product number.",
+      "unit": "",
+      "dataType": "string",
+      "source": "expression",
+      "definition": "LOOKUP_ONE(@product_groups, @product_groups.product == @product, @product_groups.product_group)"
+    },
+    {
+      "key": "history_primary",
+      "description": "Primary historical measurement used for recipe selection: BPI170 CD_Average, CMS170 CD_Average, or CLU170 YOvl_Average.",
+      "unit": "",
+      "dataType": "number",
+      "source": "expression",
+      "definition": "IF(@validated_operation == \"BPI190\", LOOKUP_ONE(@wafer_history, @wafer_history.operation == \"BPI170\" AND @wafer_history.metric_name == \"CD_Average\", @wafer_history.measurement), IF(@validated_operation == \"CMS190\", LOOKUP_ONE(@wafer_history, @wafer_history.operation == \"CMS170\" AND @wafer_history.metric_name == \"CD_Average\", @wafer_history.measurement), LOOKUP_ONE(@wafer_history, @wafer_history.operation == \"CLU170\" AND @wafer_history.metric_name == \"YOvl_Average\", @wafer_history.measurement)))"
+    },
+    {
+      "key": "history_secondary",
+      "description": "CLU160 CD_Average used by the CLU200 calculation. A neutral zero is used for non-CLU branches.",
+      "unit": "",
+      "dataType": "number",
+      "source": "expression",
+      "definition": "IF(@validated_operation == \"CLU200\", LOOKUP_ONE(@wafer_history, @wafer_history.operation == \"CLU160\" AND @wafer_history.metric_name == \"CD_Average\", @wafer_history.measurement), 0)"
+    },
+    {
+      "key": "history_tertiary",
+      "description": "BNE192 CD_Average used by the CLU200 calculation. A neutral zero is used for non-CLU branches.",
+      "unit": "",
+      "dataType": "number",
+      "source": "expression",
+      "definition": "IF(@validated_operation == \"CLU200\", LOOKUP_ONE(@wafer_history, @wafer_history.operation == \"BNE192\" AND @wafer_history.metric_name == \"CD_Average\", @wafer_history.measurement), 0)"
+    },
+    {
+      "key": "selection_value",
+      "description": "Value compared against the recipe upper bounds.",
+      "unit": "",
+      "dataType": "number",
+      "source": "expression",
+      "definition": "IF(@validated_operation == \"CLU200\", @history_primary + 500 * (@history_secondary - @history_tertiary - 0.02), @history_primary)"
+    },
+    {
+      "key": "data_is_valid",
+      "description": "Validity guard preserving the workbook zero-as-missing behavior.",
+      "unit": "",
+      "dataType": "boolean",
+      "source": "expression",
+      "definition": "@history_primary != 0 AND IF(@validated_operation == \"CLU200\", @history_secondary != 0, true)"
+    },
+    {
+      "key": "recipe",
+      "description": "Selected RIE802 recipe.",
+      "unit": "",
+      "dataType": "string",
+      "source": "expression",
+      "definition": "IF(@data_is_valid, IF(@validated_operation == \"CLU200\", LOOKUP_FIRST(@recipe_rules, @recipe_rules.operation == @validated_operation AND @recipe_rules.product_group == @product_group AND @recipe_rules.upper_bound > @selection_value, @recipe_rules.recipe), LOOKUP_FIRST(@recipe_rules, @recipe_rules.operation == @validated_operation AND @recipe_rules.product_group == @product_group AND @recipe_rules.upper_bound >= @selection_value, @recipe_rules.recipe)), LOOKUP_ONE(@failure_guard, @failure_guard.guard == true, @failure_guard.failure_value))"
+    }
+  ],
+  "dataSamples": [
+    {
+      "name": "wafer_history",
+      "description": "Latest required historical measurements for the supplied wafer.",
+      "source": "sql",
+      "dataSourceId": "wf8parametric",
+      "query": "WITH ranked_history AS (SELECT Operation AS operation, WIPDataName AS metric_name, TRY_CONVERT(float, WIPDATAVALUE) AS measurement, MoveInTimestamp, ROW_NUMBER() OVER (PARTITION BY Operation, WIPDataName ORDER BY MoveInTimestamp DESC, WIPDATAVALUE DESC) AS row_number FROM dbo.WF8_OPC_LOT_DATA_HIST WHERE ContainerName = @wafer_id AND ((Operation = 'BPI170' AND WIPDataName = 'CD_Average') OR (Operation = 'CMS170' AND WIPDataName = 'CD_Average') OR (Operation = 'CLU170' AND WIPDataName = 'YOvl_Average') OR (Operation = 'CLU160' AND WIPDataName = 'CD_Average') OR (Operation = 'BNE192' AND WIPDataName = 'CD_Average')) AND TRY_CONVERT(float, WIPDATAVALUE) IS NOT NULL) SELECT operation, metric_name, measurement FROM ranked_history WHERE row_number = 1 ORDER BY operation ASC, metric_name ASC",
+      "columns": [
+        {
+          "name": "operation",
+          "type": "string"
+        },
+        {
+          "name": "metric_name",
+          "type": "string"
+        },
+        {
+          "name": "measurement",
+          "type": "number"
+        }
+      ],
+      "limit": 5
+    },
+    {
+      "name": "supported_operations",
+      "description": "Supported current operations.",
+      "source": "static",
+      "columns": [
+        {
+          "name": "operation",
+          "type": "string"
+        }
+      ],
+      "rows": [
+        {
+          "operation": "BPI190"
+        },
+        {
+          "operation": "CMS190"
+        },
+        {
+          "operation": "CLU200"
+        }
+      ],
+      "limit": 3
+    },
+    {
+      "name": "product_groups",
+      "description": "Workbook product-number to recipe-group mapping.",
+      "source": "static",
+      "columns": [
+        {
+          "name": "product",
+          "type": "string"
+        },
+        {
+          "name": "product_group",
+          "type": "string"
+        }
+      ],
+      "rows": [
+        {
+          "product": "700-0016-000",
+          "product_group": "MG11"
+        },
+        {
+          "product": "700-0027-000",
+          "product_group": "MG11"
+        },
+        {
+          "product": "700-0047-000",
+          "product_group": "MG11"
+        },
+        {
+          "product": "700-0029-000",
+          "product_group": "M12"
+        },
+        {
+          "product": "700-0041-000",
+          "product_group": "M12"
+        },
+        {
+          "product": "700-0055-000",
+          "product_group": "M12"
+        }
+      ],
+      "limit": 6
+    },
+    {
+      "name": "failure_guard",
+      "description": "Intentionally contains no true guard row. A lookup against guard=true fails when required data is invalid.",
+      "source": "static",
+      "columns": [
+        {
+          "name": "guard",
+          "type": "boolean"
+        },
+        {
+          "name": "failure_value",
+          "type": "string"
+        }
+      ],
+      "rows": [
+        {
+          "guard": false,
+          "failure_value": ""
+        }
+      ],
+      "limit": 1
+    },
+    {
+      "name": "recipe_rules",
+      "description": "Ordered recipe rules transcribed from the Recipe Selection worksheet. Rows are kept in ascending upper-bound order within each operation and product group.",
+      "source": "static",
+      "columns": [
+        {
+          "name": "operation",
+          "type": "string"
+        },
+        {
+          "name": "product_group",
+          "type": "string"
+        },
+        {
+          "name": "upper_bound",
+          "type": "number"
+        },
+        {
+          "name": "recipe",
+          "type": "string"
+        }
+      ],
+      "rows": [
+        {
+          "operation": "BPI190",
+          "product_group": "MG11",
+          "upper_bound": 0.0485,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_4.7%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "MG11",
+          "upper_bound": 0.0495,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "MG11",
+          "upper_bound": 0.0505,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "MG11",
+          "upper_bound": 0.0515,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "MG11",
+          "upper_bound": 0.052,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "M12",
+          "upper_bound": 0.0485,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_4.7%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "M12",
+          "upper_bound": 0.0495,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "M12",
+          "upper_bound": 0.0505,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "M12",
+          "upper_bound": 0.0515,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "BPI190",
+          "product_group": "M12",
+          "upper_bound": 0.052,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "MG11",
+          "upper_bound": 0.0485,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_4.7%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "MG11",
+          "upper_bound": 0.0495,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "MG11",
+          "upper_bound": 0.0505,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "MG11",
+          "upper_bound": 0.0515,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "MG11",
+          "upper_bound": 0.052,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "M12",
+          "upper_bound": 0.0485,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_4.7%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "M12",
+          "upper_bound": 0.0495,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "M12",
+          "upper_bound": 0.0505,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "M12",
+          "upper_bound": 0.0515,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "CMS190",
+          "product_group": "M12",
+          "upper_bound": 0.052,
+          "recipe": "~PM2/PM3_N2O2_4mTIG_5.3%_12_250W_105S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "MG11",
+          "upper_bound": -2,
+          "recipe": "~FLTR_2%_25_250W_80S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "MG11",
+          "upper_bound": 2,
+          "recipe": "~FLTR_2%_25_250W_90S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "MG11",
+          "upper_bound": 25,
+          "recipe": "~FLTR_2%_25_250W_100S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "M12",
+          "upper_bound": -2,
+          "recipe": "~FLTR_2%_25_250W_80S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "M12",
+          "upper_bound": 2,
+          "recipe": "~FLTR_2%_25_250W_90S~"
+        },
+        {
+          "operation": "CLU200",
+          "product_group": "M12",
+          "upper_bound": 25,
+          "recipe": "~FLTR_2%_25_250W_100S~"
+        }
+      ],
+      "limit": 26
+    }
+  ],
+  "outputs": [
+    "recipe"
+  ]
+}

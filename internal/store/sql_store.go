@@ -264,7 +264,8 @@ func (s *Store) loadModels(ctx context.Context) error {
 func (s *Store) loadRuns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `SELECT RUN_ID, RUN_SEQUENCE, FAMILY_ID, MODEL_ID, MODEL_REVISION, STATUS,
 		COALESCE(DISPOSITION, ''), PREPARED_AT_UTC, COMPLETED_AT_UTC, CONTEXT_JSON, PARAMETERS_JSON,
-		FEEDBACK_JSON, ADAPTIVE_UPDATES_JSON FROM PCS.RUNS
+		FEEDBACK_JSON, ADAPTIVE_UPDATES_JSON, COALESCE(REQUEST_ID, N''), COALESCE(FAILURE_CODE, N''),
+		COALESCE(FAILURE_MESSAGE, N'') FROM PCS.RUNS
 		WHERE STATUS='prepared' OR RUN_SEQUENCE IN (SELECT TOP (200) RUN_SEQUENCE FROM PCS.RUNS ORDER BY RUN_SEQUENCE DESC)
 		ORDER BY RUN_SEQUENCE`)
 	if err != nil {
@@ -278,7 +279,8 @@ func (s *Store) loadRuns(ctx context.Context) error {
 		var contextJSON, parametersJSON []byte
 		var feedbackJSON, adaptiveJSON sql.NullString
 		if err := rows.Scan(&r.RunID, &r.Sequence, &r.FamilyID, &r.ModelID, &r.ModelRevision, &r.Status,
-			&r.Disposition, &prepared, &completed, &contextJSON, &parametersJSON, &feedbackJSON, &adaptiveJSON); err != nil {
+			&r.Disposition, &prepared, &completed, &contextJSON, &parametersJSON, &feedbackJSON, &adaptiveJSON,
+			&r.RequestID, &r.FailureCode, &r.FailureMessage); err != nil {
 			return err
 		}
 		r.PreparedAt = prepared.UTC().Format(time.RFC3339Nano)
@@ -599,14 +601,14 @@ func (s *Store) saveRunSQL(ctx context.Context, tx *sql.Tx, r RunRecord) error {
 		return err
 	}
 	if exists == 0 {
-		err = tx.QueryRowContext(ctx, `INSERT PCS.RUNS (RUN_ID,FAMILY_ID,MODEL_ID,MODEL_REVISION,STATUS,DISPOSITION,PREPARED_AT_UTC,COMPLETED_AT_UTC,CONTEXT_JSON,PARAMETERS_JSON,FEEDBACK_JSON,ADAPTIVE_UPDATES_JSON,PARTITION_HASH,PARTITION_JSON)
-			OUTPUT INSERTED.RUN_SEQUENCE VALUES (@p1,@p2,@p3,@p4,@p5,NULLIF(@p6,''),COALESCE(@p7,SYSUTCDATETIME()),@p8,@p9,@p10,@p11,@p12,@p13,@p14)`,
-			r.RunID, r.FamilyID, r.ModelID, r.ModelRevision, r.Status, r.Disposition, nullableTime(r.PreparedAt), nullableTime(r.CompletedAt), string(contextJSON), string(parametersJSON), feedbackJSON, adaptiveJSON, partitionHash, string(partitionJSON)).Scan(&r.Sequence)
+		err = tx.QueryRowContext(ctx, `INSERT PCS.RUNS (RUN_ID,FAMILY_ID,MODEL_ID,MODEL_REVISION,STATUS,DISPOSITION,PREPARED_AT_UTC,COMPLETED_AT_UTC,CONTEXT_JSON,PARAMETERS_JSON,FEEDBACK_JSON,ADAPTIVE_UPDATES_JSON,REQUEST_ID,FAILURE_CODE,FAILURE_MESSAGE,PARTITION_HASH,PARTITION_JSON)
+			OUTPUT INSERTED.RUN_SEQUENCE VALUES (@p1,@p2,@p3,@p4,@p5,NULLIF(@p6,''),COALESCE(@p7,SYSUTCDATETIME()),@p8,@p9,@p10,@p11,@p12,NULLIF(@p13,N''),NULLIF(@p14,N''),NULLIF(@p15,N''),@p16,@p17)`,
+			r.RunID, r.FamilyID, r.ModelID, r.ModelRevision, r.Status, r.Disposition, nullableTime(r.PreparedAt), nullableTime(r.CompletedAt), string(contextJSON), string(parametersJSON), feedbackJSON, adaptiveJSON, r.RequestID, r.FailureCode, r.FailureMessage, partitionHash, string(partitionJSON)).Scan(&r.Sequence)
 		if err != nil {
 			return err
 		}
 	} else if r.Status != "prepared" {
-		_, err = tx.ExecContext(ctx, `UPDATE PCS.RUNS SET STATUS=@p2,COMPLETED_AT_UTC=COALESCE(@p3,SYSUTCDATETIME()),FEEDBACK_JSON=@p4,ADAPTIVE_UPDATES_JSON=@p5 WHERE RUN_ID=@p1 AND STATUS='prepared'`, r.RunID, r.Status, nullableTime(r.CompletedAt), feedbackJSON, adaptiveJSON)
+		_, err = tx.ExecContext(ctx, `UPDATE PCS.RUNS SET STATUS=@p2,COMPLETED_AT_UTC=COALESCE(@p3,SYSUTCDATETIME()),FEEDBACK_JSON=@p4,ADAPTIVE_UPDATES_JSON=@p5,FAILURE_CODE=NULLIF(@p6,N''),FAILURE_MESSAGE=NULLIF(@p7,N'') WHERE RUN_ID=@p1 AND STATUS='prepared'`, r.RunID, r.Status, nullableTime(r.CompletedAt), feedbackJSON, adaptiveJSON, r.FailureCode, r.FailureMessage)
 		if err != nil {
 			return err
 		}
@@ -690,7 +692,7 @@ func (s *Store) saveRunSamplesSQL(ctx context.Context, tx *sql.Tx, r RunRecord) 
 		snapshot, _ := json.Marshal(rows)
 		_, err := tx.ExecContext(ctx, `IF NOT EXISTS(SELECT 1 FROM PCS.RUN_DATA_SAMPLES WHERE RUN_ID=@p1 AND SAMPLE_NAME=@p2)
 			INSERT PCS.RUN_DATA_SAMPLES (RUN_ID,SAMPLE_NAME,SAMPLE_SOURCE,DATA_SOURCE_ID,PARAMETERIZED_QUERY_TEXT,QUERY_HASH,ROW_COUNT,SNAPSHOT_JSON)
-			VALUES (@p1,@p2,@p3,NULLIF(@p4,N''),NULLIF(@p5,N''),@p6,@p7,@p8)`, r.RunID, name, sampleSource, sourceID, query, queryHash, len(rows), string(snapshot))
+			VALUES (@p1,@p2,@p3,NULLIF(@p4,N''),NULLIF(@p5,N''),CONVERT(binary(32),@p6),@p7,@p8)`, r.RunID, name, sampleSource, sourceID, query, queryHash, len(rows), string(snapshot))
 		if err != nil {
 			return err
 		}

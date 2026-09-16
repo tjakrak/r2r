@@ -172,6 +172,54 @@ func TestRevisionLifecycle(t *testing.T) {
 	}
 }
 
+func TestSubmissionAndApprovalRequireEnabledDataSources(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	model := control.Model{
+		ID: "sql-model-r1", FamilyID: "sql-model", Name: "SQL model", Revision: 1,
+		Status: "draft", ChangeNote: "Initial", CreatedBy: "ME",
+		Indexes: map[string]control.IndexValues{
+			"machine": {"M1"}, "action": {"RUN"}, "material": {"WAFER"},
+		},
+		Parameters: []control.ParameterDefinition{{
+			Key: "measurement", Source: "sql", DataType: "number",
+			DataSourceID: "measurements", Definition: "SELECT 1",
+		}},
+		Outputs: []string{"measurement"},
+	}
+	data, _ := json.Marshal(Config{Models: []control.Model{model}})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitForApproval(model.ID, "ME"); err == nil || !strings.Contains(err.Error(), "unknown data source") {
+		t.Fatalf("expected missing source to block submission, got %v", err)
+	}
+	source, err := s.CreateSource(Source{ID: "measurements", Name: "Measurements", Engine: "sqlserver", Host: "db.local", Port: 1433, Database: "process", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitForApproval(model.ID, "ME"); err != nil {
+		t.Fatalf("enabled source should allow submission: %v", err)
+	}
+	source.Enabled = false
+	if _, err := s.UpdateSource(source.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Approve(model.ID, "ADMIN", false); err == nil || !strings.Contains(err.Error(), "disabled data source") {
+		t.Fatalf("expected disabled source to block approval, got %v", err)
+	}
+	source.Enabled = true
+	if _, err := s.UpdateSource(source.ID, source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Approve(model.ID, "ADMIN", false); err != nil {
+		t.Fatalf("re-enabled source should allow approval: %v", err)
+	}
+}
+
 func TestRejectReturnsPendingRevisionToDraft(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	model := control.Model{ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "draft", ChangeNote: "Initial", CreatedBy: "ME", Indexes: map[string]control.IndexValues{"machine": {"E1"}, "action": {"ETCH"}, "material": {"OXIDE"}}, Parameters: []control.ParameterDefinition{{Key: "recipe", Source: "constant", Definition: "2"}}, Outputs: []string{"recipe"}}
@@ -288,7 +336,7 @@ func TestDeleteFamilyRejectsRetainedExecutionHistory(t *testing.T) {
 	}
 }
 
-func TestRetireAndPurgeFamilyWithExecutionHistory(t *testing.T) {
+func TestDeactivateAndPurgeFamilyWithExecutionHistory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	model := control.Model{ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "approved", Enabled: true}
 	data, _ := json.Marshal(Config{
@@ -303,9 +351,9 @@ func TestRetireAndPurgeFamilyWithExecutionHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	retired, err := s.RetireFamily(model.ID)
-	if err != nil || retired.Enabled {
-		t.Fatalf("retire family failed: %+v %v", retired, err)
+	deactivated, err := s.DeactivateFamily(model.ID)
+	if err != nil || deactivated.Enabled {
+		t.Fatalf("deactivate family failed: %+v %v", deactivated, err)
 	}
 	summary, err := s.ModelPurgeSummary(model.ID)
 	if err != nil || summary.RevisionCount != 1 || summary.RunCount != 1 || summary.ModelName != "Etch" {
@@ -317,6 +365,34 @@ func TestRetireAndPurgeFamilyWithExecutionHistory(t *testing.T) {
 	}
 	if _, exists := s.Model(model.ID); exists || len(s.Config().Runs) != 0 || len(s.Config().AdaptiveStates) != 0 {
 		t.Fatal("purge retained current model, run, or adaptive state")
+	}
+}
+
+func TestReactivateFamilyEnablesLatestApprovedRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	model := control.Model{
+		ID: "etch-r2", FamilyID: "etch", Name: "Etch", Revision: 2,
+		Status: "approved", Enabled: false,
+		Indexes: map[string]control.IndexValues{
+			"machine": {"M1"}, "action": {"RUN"}, "material": {"WAFER"},
+		},
+		Parameters: []control.ParameterDefinition{{Key: "recipe", Source: "expression", DataType: "string", Definition: `"R1"`}},
+		Outputs:    []string{"recipe"},
+	}
+	data, _ := json.Marshal(Config{Models: []control.Model{model}})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reactivated, err := s.ReactivateFamily(model.ID)
+	if err != nil || !reactivated.Enabled || reactivated.ID != model.ID {
+		t.Fatalf("reactivate family failed: %+v %v", reactivated, err)
+	}
+	if _, err := s.ReactivateFamily(model.ID); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("expected active model conflict, got %v", err)
 	}
 }
 
@@ -353,7 +429,7 @@ func TestPreparedRunLimitUsesConfiguredPartition(t *testing.T) {
 	if _, err := s.RecordPreparedRun(record("run-3", "2"), model, nil); err != nil {
 		t.Fatalf("independent chamber should not be blocked: %v", err)
 	}
-	if err := s.CompleteRun("run-1", "completed", nil, nil); err != nil {
+	if err := s.CompleteRun("run-1", "completed", nil, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RecordPreparedRun(record("run-4", "1"), model, nil); err != nil {

@@ -153,6 +153,9 @@ type RunRecord struct {
 	AdaptiveUpdates map[string]float64                  `json:"adaptiveUpdates,omitempty"`
 	DataSamples     map[string][]map[string]interface{} `json:"dataSamples,omitempty"`
 	Disposition     string                              `json:"disposition,omitempty"`
+	RequestID       string                              `json:"requestId,omitempty"`
+	FailureCode     string                              `json:"failureCode,omitempty"`
+	FailureMessage  string                              `json:"failureMessage,omitempty"`
 }
 type AdaptiveState struct {
 	Value        float64 `json:"value"`
@@ -436,7 +439,7 @@ func (s *Store) HasUnfinishedRun(model control.Model, context map[string]interfa
 	}
 	return false
 }
-func (s *Store) CompleteRun(id, status string, feedback map[string]interface{}, updates map[string]float64) error {
+func (s *Store) CompleteRun(id, status string, feedback map[string]interface{}, updates map[string]float64, failureCode, failureMessage string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index := range s.config.Runs {
@@ -448,6 +451,8 @@ func (s *Store) CompleteRun(id, status string, feedback map[string]interface{}, 
 			s.config.Runs[index].Feedback = feedback
 			s.config.Runs[index].CompletedAt = time.Now().UTC().Format(time.RFC3339)
 			s.config.Runs[index].AdaptiveUpdates = updates
+			s.config.Runs[index].FailureCode = failureCode
+			s.config.Runs[index].FailureMessage = failureMessage
 			return s.persistRun(s.config.Runs[index])
 		}
 	}
@@ -920,7 +925,7 @@ func (s *Store) DeleteFamily(id string) error {
 	return s.persist()
 }
 
-func (s *Store) RetireFamily(id string) (control.Model, error) {
+func (s *Store) DeactivateFamily(id string) (control.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	familyID := ""
@@ -934,22 +939,112 @@ func (s *Store) RetireFamily(id string) (control.Model, error) {
 		return control.Model{}, errors.New("model not found")
 	}
 	changed := []control.Model{}
-	var retired control.Model
+	var deactivated control.Model
 	for index := range s.config.Models {
 		model := &s.config.Models[index]
 		if model.FamilyID == familyID && model.Status == "approved" && model.Enabled {
 			model.Enabled = false
-			retired = *model
+			deactivated = *model
 			changed = append(changed, *model)
 		}
 	}
 	if len(changed) == 0 {
-		return control.Model{}, errors.New("model is already retired")
+		return control.Model{}, errors.New("model is already inactive")
 	}
 	if err := s.persistModels(changed...); err != nil {
 		return control.Model{}, err
 	}
-	return retired, nil
+	return deactivated, nil
+}
+
+// ReactivateFamily enables the latest approved revision in an inactive model family.
+// It revalidates the stored definition and its registered dependencies before making
+// the revision eligible for production selection again.
+func (s *Store) ReactivateFamily(id string) (control.Model, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	familyID := ""
+	for _, model := range s.config.Models {
+		if model.ID == id {
+			familyID = model.FamilyID
+			break
+		}
+	}
+	if familyID == "" {
+		return control.Model{}, errors.New("model not found")
+	}
+	latestApproved := -1
+	for index, model := range s.config.Models {
+		if model.FamilyID != familyID || model.Status != "approved" {
+			continue
+		}
+		if model.Enabled {
+			return control.Model{}, errors.New("model is already active")
+		}
+		if latestApproved < 0 || model.Revision > s.config.Models[latestApproved].Revision {
+			latestApproved = index
+		}
+	}
+	if latestApproved < 0 {
+		return control.Model{}, errors.New("model has no approved inactive revision to reactivate")
+	}
+	candidate := s.config.Models[latestApproved]
+	if err := validateProductionReadyModel(candidate, s.config.InputDefinitions, s.config.Sources); err != nil {
+		return control.Model{}, fmt.Errorf("cannot reactivate model: %w", err)
+	}
+	for _, existing := range s.config.Models {
+		if existing.FamilyID != familyID && existing.Status == "approved" && existing.Enabled && control.HasAmbiguousRouting(candidate, existing) {
+			return control.Model{}, fmt.Errorf("cannot reactivate: routing overlaps equally with active model %q", existing.Name)
+		}
+	}
+	s.config.Models[latestApproved].Enabled = true
+	if err := s.persistModels(s.config.Models[latestApproved]); err != nil {
+		s.config.Models[latestApproved].Enabled = false
+		return control.Model{}, err
+	}
+	return s.config.Models[latestApproved], nil
+}
+
+func validateEnabledDataSources(model control.Model, sources []Source) error {
+	registered := map[string]Source{}
+	for _, source := range sources {
+		registered[strings.ToLower(strings.TrimSpace(source.ID))] = source
+	}
+	check := func(sourceID, owner string) error {
+		source, exists := registered[strings.ToLower(strings.TrimSpace(sourceID))]
+		if !exists {
+			return fmt.Errorf("%s references unknown data source %q", owner, sourceID)
+		}
+		if !source.Enabled {
+			return fmt.Errorf("%s references disabled data source %q", owner, sourceID)
+		}
+		return nil
+	}
+	for _, parameter := range model.Parameters {
+		if parameter.Source == "sql" {
+			if err := check(parameter.DataSourceID, "parameter "+parameter.Key); err != nil {
+				return err
+			}
+		}
+	}
+	for _, sample := range model.DataSamples {
+		if sample.Source == "sql" {
+			if err := check(sample.DataSourceID, "data sample "+sample.Key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateProductionReadyModel(model control.Model, definitions []InputDefinition, sources []Source) error {
+	if err := validateRegisteredInputs(model, definitions); err != nil {
+		return err
+	}
+	if err := validateEnabledDataSources(model, sources); err != nil {
+		return err
+	}
+	return control.ValidateModel(model)
 }
 
 func (s *Store) ModelPurgeSummary(id string) (ModelPurgeSummary, error) {
@@ -1048,11 +1143,8 @@ func (s *Store) SubmitForApproval(id, actor string) (control.Model, error) {
 		if strings.TrimSpace(actor) == "" {
 			return control.Model{}, errors.New("submitter is required")
 		}
-		if err := validateRegisteredInputs(model, s.config.InputDefinitions); err != nil {
-			return control.Model{}, err
-		}
-		if err := control.ValidateModel(model); err != nil {
-			return control.Model{}, err
+		if err := validateProductionReadyModel(model, s.config.InputDefinitions, s.config.Sources); err != nil {
+			return control.Model{}, fmt.Errorf("cannot submit revision for approval: %w", err)
 		}
 		s.config.Models[index].Status = "pending_approval"
 		s.config.Models[index].Enabled = false
@@ -1115,6 +1207,9 @@ func (s *Store) Approve(id, actor string, allowSelfApproval bool) (control.Model
 	}
 	if !allowSelfApproval && strings.EqualFold(strings.TrimSpace(target.SubmittedBy), strings.TrimSpace(actor)) {
 		return control.Model{}, errors.New("the submitter cannot approve their own revision")
+	}
+	if err := validateProductionReadyModel(target, s.config.InputDefinitions, s.config.Sources); err != nil {
+		return control.Model{}, fmt.Errorf("cannot approve revision: %w", err)
 	}
 	for _, existing := range s.config.Models {
 		if existing.FamilyID != target.FamilyID && existing.Status == "approved" && existing.Enabled && control.HasAmbiguousRouting(target, existing) {

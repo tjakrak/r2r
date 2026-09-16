@@ -304,7 +304,15 @@ func evalNode(node ast.Expr, vars map[string]float64, samples map[string][]map[s
 				return 0, fmt.Errorf("abs requires one argument")
 			}
 			return math.Abs(args[0]), nil
-		case "ceil", "cos", "exp", "floor", "log", "round", "sin", "sqrt", "tan":
+		case "round":
+			if len(args) != 1 && len(args) != 2 {
+				return 0, fmt.Errorf("round requires a value and an optional number of decimal places")
+			}
+			if len(args) == 1 {
+				return math.Round(args[0]), nil
+			}
+			return roundToDecimalPlaces(args[0], args[1])
+		case "ceil", "cos", "exp", "floor", "log", "sin", "sqrt", "tan":
 			if len(args) != 1 {
 				return 0, fmt.Errorf("%s requires one argument", name)
 			}
@@ -319,8 +327,6 @@ func evalNode(node ast.Expr, vars map[string]float64, samples map[string][]map[s
 				return math.Floor(args[0]), nil
 			case "log":
 				return math.Log(args[0]), nil
-			case "round":
-				return math.Round(args[0]), nil
 			case "sin":
 				return math.Sin(args[0]), nil
 			case "sqrt":
@@ -337,6 +343,17 @@ func evalNode(node ast.Expr, vars map[string]float64, samples map[string][]map[s
 		return 0, fmt.Errorf("function %q is not allowed", id.Name)
 	}
 	return 0, fmt.Errorf("expression element is not allowed")
+}
+
+func roundToDecimalPlaces(value, places float64) (float64, error) {
+	if math.Trunc(places) != places {
+		return 0, fmt.Errorf("round decimal places must be a whole number")
+	}
+	if places < -15 || places > 15 {
+		return 0, fmt.Errorf("round decimal places must be between -15 and 15")
+	}
+	factor := math.Pow(10, places)
+	return math.Round(value*factor) / factor, nil
 }
 
 func positionalIndex(function string, call *ast.CallExpr, rowCount int) (int, error) {

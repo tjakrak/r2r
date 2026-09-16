@@ -190,6 +190,9 @@ type ActivityRow = {
   status: string;
   parameters: Record<string, unknown>;
   outputs: { parameter: string; value: unknown; unit?: string }[];
+  requestId?: string;
+  failureCode?: string;
+  failureMessage?: string;
 };
 type RunRecord = {
   runId: string;
@@ -560,6 +563,13 @@ export default function App() {
                           </div>
                         </summary>
                         <div className="execution-parameters">
+                          {row.failureCode && (
+                            <>
+                              <div><strong>Failure code</strong><code>{row.failureCode}</code></div>
+                              <div><strong>Failure message</strong><code>{row.failureMessage}</code></div>
+                            </>
+                          )}
+                          {row.requestId && <div><strong>Request ID</strong><code>{row.requestId}</code></div>}
                           <div className="execution-parameter-head"><span>Parameter</span><span>Resolved value</span></div>
                           {Object.entries(row.parameters || {}).map(([name, value]) => (
                             <div key={name}><strong>{name}</strong><code>{formatParameterValue(value)}</code></div>
@@ -1277,7 +1287,7 @@ function Documentation() {
               <article>
                 <strong>Math functions</strong>
                 <span>Combine supported functions with normal arithmetic.</span>
-                <pre>{`ROUND(ABS(@target_cd - @measured_cd) * 1000)`}</pre>
+                <pre>{`ROUND(ABS(@target_cd - @measured_cd), 3)`}</pre>
               </article>
               <article>
                 <strong>String functions</strong>
@@ -3048,7 +3058,21 @@ function Empty(p: { icon: React.ReactNode; title: string; text: string }) {
     </div>
   );
 }
+
+function effectiveModelStatus(model: Model): { className: string; label: string } {
+  if (model.status === 'approved') {
+    return model.enabled
+      ? { className: 'active', label: 'ACTIVE' }
+      : { className: 'inactive', label: 'INACTIVE' };
+  }
+  if (model.status === 'pending_approval') {
+    return { className: 'pending_approval', label: 'PENDING APPROVAL' };
+  }
+  return { className: model.status, label: model.status.toUpperCase() };
+}
+
 function ModelRow({ model, ownerInactive, onOpen }: { model: Model; ownerInactive: boolean; onOpen: () => void }) {
+  const displayedStatus = effectiveModelStatus(model);
   return (
     <article className="model-row">
       <div className="model-main">
@@ -3058,15 +3082,8 @@ function ModelRow({ model, ownerInactive, onOpen }: { model: Model; ownerInactiv
         <div>
           <div className="model-title">
             <h3>{model.name}</h3>
-            <span className={`status ${model.status}`}>
-              REV {model.revision}{' '}
-              {model.status === 'approved'
-                ? model.enabled
-                  ? 'ACTIVE'
-                  : 'RETIRED'
-                : model.status === 'pending_approval'
-                  ? 'PENDING APPROVAL'
-                  : model.status.toUpperCase()}
+            <span className={`status ${displayedStatus.className}`}>
+              REV {model.revision} {displayedStatus.label}
             </span>
             {ownerInactive && <span className="status owner-inactive">OWNER INACTIVE</span>}
           </div>
@@ -3461,13 +3478,35 @@ function ModelDrawer({
       setBusy(false);
     }
   };
-  const retireFamily = async () => {
-    if (!window.confirm(`Retire ${model.name}? It will no longer be selected for new production runs.`)) return;
+  const deactivateFamily = async () => {
+    if (!window.confirm(`Deactivate ${model.name}? It will no longer be selected for new production runs.`)) return;
     setBusy(true);
     setActionError('');
     try {
-      await api(`/api/models/${model.id}/retire`, { method: 'POST' });
+      await api(`/api/models/${model.id}/deactivate`, { method: 'POST' });
       await onChanged();
+    } catch (reason) {
+      setActionError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const reactivateFamily = async () => {
+    const reason = window.prompt(`Why are you reactivating ${model.name}?`);
+    if (reason === null) return;
+    if (!reason.trim()) {
+      setActionError('A reactivation reason is required.');
+      return;
+    }
+    setBusy(true);
+    setActionError('');
+    try {
+      await api(`/api/models/${model.id}/reactivate`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      await onChanged();
+      await refreshHistory();
     } catch (reason) {
       setActionError((reason as Error).message);
     } finally {
@@ -3508,9 +3547,15 @@ function ModelDrawer({
               {role === 'admin' && (
                 <>
                   {activeRevision && (
-                    <button className="secondary model-action" disabled={busy} onClick={retireFamily}>
+                    <button className="secondary model-action" disabled={busy} onClick={deactivateFamily}>
                       <FileClock />
-                      Retire model
+                      Deactivate model
+                    </button>
+                  )}
+                  {!activeRevision && currentModel.status === 'approved' && (
+                    <button className="secondary model-action" disabled={busy} onClick={reactivateFamily}>
+                      <ShieldCheck />
+                      Reactivate model
                     </button>
                   )}
                   <button className="danger model-action" disabled={busy} onClick={deleteFamily}>
@@ -3531,7 +3576,7 @@ function ModelDrawer({
               </button>
             </div>
             <section className="contract">
-              <h3>Active model contract</h3>
+              <h3>{activeRevision ? 'Active model contract' : 'Model contract'}</h3>
               {model.status === 'approved' && (
                 <button
                   className="secondary chart-open-button"
@@ -3591,11 +3636,20 @@ function ModelDrawer({
             <div className="timeline compact">
               {history.map((item) => (
                 <div className="timeline-item" key={item.id}>
-                  <i className={item.status}></i>
+                  <i className={effectiveModelStatus(item).className}></i>
                   <div>
                     <div className="timeline-title">
                       <strong>Revision {item.revision}</strong>
-                      <span className={`status ${item.status}`}>{item.status.toUpperCase()}</span>
+                      {item.status === 'approved' && !item.enabled ? (
+                        <>
+                          <span className="status approved">APPROVED</span>
+                          <span className="status inactive">INACTIVE</span>
+                        </>
+                      ) : (
+                        <span className={`status ${effectiveModelStatus(item).className}`}>
+                          {effectiveModelStatus(item).label}
+                        </span>
+                      )}
                     </div>
                     <p>{item.changeNote}</p>
                     <small>

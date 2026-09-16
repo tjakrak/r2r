@@ -684,7 +684,8 @@ main > header {
   font-weight: 850;
   letter-spacing: 0.6px;
 }
-.status.approved {
+.status.approved,
+.status.active {
   background: #e4f3eb;
   color: #16704b;
 }
@@ -696,7 +697,8 @@ main > header {
   background: #e7eef9;
   color: #355e93;
 }
-.status.superseded {
+.status.superseded,
+.status.inactive {
   background: #edf0f2;
   color: #6d7780;
 }
@@ -1306,9 +1308,14 @@ main > header {
   margin-top: 4px;
   z-index: 2;
 }
-.timeline-item > i.approved {
+.timeline-item > i.approved,
+.timeline-item > i.active {
   background: #299469;
   box-shadow: 0 0 0 4px #e3f3eb;
+}
+.timeline-item > i.inactive {
+  background: #8a949c;
+  box-shadow: 0 0 0 4px #edf0f2;
 }
 .timeline-item > i.draft {
   background: #dda239;

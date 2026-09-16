@@ -479,7 +479,22 @@ func TestCompleteAcceptsRequiredFeedbackInSameRequest(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsOutOfLimitRunWithoutRecordingIt(t *testing.T) {
+func TestCompleteRecordsExternalFailureDetails(t *testing.T) {
+	s, runID := completionTestServer(t)
+	body := `{"status":"failed","failureMessage":"Equipment interlock activated."}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+runID+"/complete", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	s.complete(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("failed completion was rejected: %d %s", recorder.Code, recorder.Body.String())
+	}
+	record, _ := s.store.Run(runID)
+	if record.Status != "run_failed" || record.FailureCode != "EXTERNAL_PROCESS_FAILED" || record.FailureMessage != "Equipment interlock activated." {
+		t.Fatalf("external failure details were not recorded: %+v", record)
+	}
+}
+
+func TestPrepareRecordsOutOfLimitRunFailure(t *testing.T) {
 	model := control.Model{
 		ID: "limit-r1", FamilyID: "limit", Name: "Limit", Revision: 1,
 		Status: "approved", Enabled: true,
@@ -511,8 +526,12 @@ func TestPrepareRejectsOutOfLimitRunWithoutRecordingIt(t *testing.T) {
 		!strings.Contains(recorder.Body.String(), `parameter \"result\" value 2 is below LSL 3`) {
 		t.Fatalf("expected structured run rejection, got %d %s", recorder.Code, recorder.Body.String())
 	}
-	if len(st.RecentRuns(10)) != 0 {
-		t.Fatal("rejected run was persisted")
+	runs := st.RecentRuns(10)
+	if len(runs) != 1 || runs[0].Status != "run_failed" || runs[0].FailureCode != "PARAMETER_LIMIT_REJECTED" {
+		t.Fatalf("rejected run failure was not persisted correctly: %+v", runs)
+	}
+	if !strings.Contains(runs[0].FailureMessage, `parameter "result" value 2 is below LSL 3`) {
+		t.Fatalf("rejected run failure message was not persisted: %+v", runs[0])
 	}
 }
 

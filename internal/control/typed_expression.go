@@ -601,6 +601,9 @@ func inferTypedNode(node ast.Expr, model Model, refs map[string]string) (string,
 			if len(n.Args) == 0 {
 				return "", fmt.Errorf("%s needs at least one numerical argument", name)
 			}
+			if name == "ROUND" && len(n.Args) != 1 && len(n.Args) != 2 {
+				return "", fmt.Errorf("ROUND requires a value and an optional number of decimal places")
+			}
 			for _, argument := range n.Args {
 				typ, err := inferTypedNode(argument, model, refs)
 				if err != nil {

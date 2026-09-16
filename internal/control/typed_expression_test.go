@@ -73,6 +73,26 @@ func TestTypedExpressionSupportsAggregateMathAndStringFunctions(t *testing.T) {
 	if value != float64(5) {
 		t.Fatalf("expected 5, got %#v", value)
 	}
+	value, err = EvaluateTypedExpression(`ROUND(12.3456, 2)`, "number", model, nil, nil, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != 12.35 {
+		t.Fatalf("expected 12.35, got %#v", value)
+	}
+	value, err = EvaluateTypedExpression(`ROUND(126, -1)`, "number", model, nil, nil, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != float64(130) {
+		t.Fatalf("expected 130, got %#v", value)
+	}
+	if err := ValidateTypedExpression(`ROUND(12.3, 2, 1)`, "number", model, nil); err == nil {
+		t.Fatal("expected ROUND with three arguments to fail validation")
+	}
+	if _, err := EvaluateTypedExpression(`ROUND(12.3, 1.5)`, "number", model, nil, nil, rows); err == nil || !strings.Contains(err.Error(), "whole number") {
+		t.Fatalf("expected non-integer decimal places to fail, got %v", err)
+	}
 }
 
 func TestValidateModelAcceptsIfComparisonAgainstSQLParameter(t *testing.T) {
