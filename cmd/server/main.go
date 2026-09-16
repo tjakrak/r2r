@@ -667,10 +667,12 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		return
 	}
 	runID := newRunID()
+	requestID := r.Header.Get("X-Request-ID")
 	limitResults := map[string]control.OutputValue{}
 	collectLimit := func(result control.OutputValue) { limitResults[result.Parameter] = result }
 	values, samples, unresolvedSQL, err := control.ResolveModelWithLimitCollector(model, context, nil, nil, s.store.AdaptiveValues(model, context), s.sqlParameterResolver(r.Context()), s.sqlDataSampleResolver(r.Context()), collectLimit)
 	if err != nil {
+		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
 		if writeParameterLimitRejection(w, runID, model, err) {
 			return
 		}
@@ -682,6 +684,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		for _, parameter := range unresolvedSQL {
 			missing = append(missing, map[string]string{"key": parameter.Key, "query": parameter.Definition})
 		}
+		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", "SQL resolver is not configured", "run_rejected")
 		write(w, 501, map[string]interface{}{"error": "SQL resolver is not configured", "unresolvedParameters": missing, "controlModel": map[string]interface{}{"id": model.ID, "revision": model.Revision}})
 		return
 	}
@@ -689,6 +692,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	if commitAdaptive || !s.store.HasUnfinishedRun(model, context) {
 		adaptiveUpdates, err = control.CalculateAdaptiveUpdatesForSource(model, values, "parameter")
 		if err != nil {
+			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", err.Error(), "run_rejected")
 			write(w, 422, map[string]string{"error": err.Error()})
 			return
 		}
@@ -702,6 +706,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		collectLimit = func(result control.OutputValue) { limitResults[result.Parameter] = result }
 		values, samples, unresolvedSQL, err = control.ResolveModelWithLimitCollector(model, context, values, samples, nextAdaptive, nil, nil, collectLimit)
 		if err != nil {
+			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
 			if writeParameterLimitRejection(w, runID, model, err) {
 				return
 			}
@@ -709,12 +714,14 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 			return
 		}
 		if len(unresolvedSQL) > 0 {
+			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", "failed to reevaluate parameters after adaptive update", "run_rejected")
 			write(w, 500, map[string]string{"error": "failed to reevaluate parameters after adaptive update"})
 			return
 		}
 	}
 	outputs, err := control.EvaluateResolvedOutputs(model, values, limitResults)
 	if err != nil {
+		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
@@ -742,10 +749,12 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		}
 	}
 	if len(rejected) > 0 {
+		failureMessage := "Run is not allowed: " + strings.Join(rejectionReasons, "; ") + "."
+		s.recordExecutionFailure(runID, requestID, model, context, values, samples, outputs, "PARAMETER_LIMIT_REJECTED", failureMessage, "run_rejected")
 		write(w, 422, map[string]interface{}{
 			"status":      "rejected",
 			"disposition": "run_rejected",
-			"error":       "Run is not allowed: " + strings.Join(rejectionReasons, "; ") + ".",
+			"error":       failureMessage,
 			"runId":       runID,
 			"controlModel": map[string]interface{}{
 				"id": model.ID, "familyId": model.FamilyID, "name": model.Name,
@@ -757,6 +766,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	}
 	if commitAdaptive {
 		if err := s.store.CommitAdaptive(model, context, runID, adaptiveUpdates); err != nil {
+			s.recordExecutionFailure(runID, requestID, model, context, values, samples, outputs, "RUN_PERSISTENCE_FAILED", "failed to persist adaptive state", "run_rejected")
 			write(w, 500, map[string]string{"error": "failed to persist adaptive state"})
 			return
 		}
@@ -766,8 +776,8 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	if !commitAdaptive {
 		status = "prepared"
 	}
-	result := map[string]interface{}{"id": id, "runId": runID, "status": status, "controlModel": map[string]interface{}{"id": model.ID, "familyId": model.FamilyID, "name": model.Name, "revision": model.Revision, "owner": model.Owner}, "routing": map[string]string{"reason": reason}, "parameters": values, "adaptiveUpdates": adaptiveUpdates, "dataSamples": samples, "outputs": outputs, "disposition": disposition, "meta": map[string]string{"receivedAt": time.Now().UTC().Format(time.RFC3339)}}
-	record := store.RunRecord{RunID: runID, FamilyID: model.FamilyID, ModelID: model.ID, ModelRevision: model.Revision, Status: status, PreparedAt: time.Now().UTC().Format(time.RFC3339), Context: context, Parameters: values, Outputs: outputs, AdaptiveUpdates: adaptiveUpdates, DataSamples: samples, Disposition: disposition}
+	result := map[string]interface{}{"id": id, "runId": runID, "requestId": requestID, "status": status, "controlModel": map[string]interface{}{"id": model.ID, "familyId": model.FamilyID, "name": model.Name, "revision": model.Revision, "owner": model.Owner}, "routing": map[string]string{"reason": reason}, "parameters": values, "adaptiveUpdates": adaptiveUpdates, "dataSamples": samples, "outputs": outputs, "disposition": disposition, "meta": map[string]string{"receivedAt": time.Now().UTC().Format(time.RFC3339)}}
+	record := store.RunRecord{RunID: runID, FamilyID: model.FamilyID, ModelID: model.ID, ModelRevision: model.Revision, Status: status, PreparedAt: time.Now().UTC().Format(time.RFC3339), Context: context, Parameters: values, Outputs: outputs, AdaptiveUpdates: adaptiveUpdates, DataSamples: samples, Disposition: disposition, RequestID: requestID}
 	if status != "prepared" {
 		record.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	}
@@ -790,6 +800,57 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		result["sequence"] = sequence
 	}
 	write(w, 200, result)
+}
+
+func (s *server) recordExecutionFailure(runID, requestID string, model control.Model, context, parameters map[string]interface{}, samples map[string][]map[string]interface{}, outputs []control.OutputValue, failureCode, failureMessage, disposition string) {
+	if parameters == nil {
+		parameters = map[string]interface{}{}
+	}
+	if samples == nil {
+		samples = map[string][]map[string]interface{}{}
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	record := store.RunRecord{
+		RunID: runID, FamilyID: model.FamilyID, ModelID: model.ID, ModelRevision: model.Revision,
+		Status: "run_failed", PreparedAt: now, CompletedAt: now, Context: context,
+		Parameters: parameters, Outputs: outputs, DataSamples: samples, Disposition: disposition,
+		RequestID: requestID, FailureCode: failureCode, FailureMessage: truncateFailureMessage(failureMessage),
+	}
+	if err := s.store.RecordRun(record); err != nil {
+		operationalLog("ERROR", "failed_run_record_write_failed", map[string]interface{}{
+			"requestId": requestID, "runId": runID, "error": err.Error(),
+		})
+	}
+}
+
+func failureCodeForExecutionError(err error) string {
+	var limitErr *control.ParameterLimitError
+	if errors.As(err, &limitErr) {
+		return "PARAMETER_LIMIT_REJECTED"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded"):
+		return "DATABASE_QUERY_TIMEOUT"
+	case strings.Contains(message, "data sample") && strings.Contains(message, "query failed"):
+		return "DATA_SAMPLE_QUERY_FAILED"
+	case strings.Contains(message, "sql parameter") && strings.Contains(message, "query failed"):
+		return "PARAMETER_QUERY_FAILED"
+	case strings.Contains(message, "data sample") && (strings.Contains(message, "column") || strings.Contains(message, "schema")):
+		return "DATA_SAMPLE_SCHEMA_FAILED"
+	case strings.Contains(message, "type") || strings.Contains(message, "must be a number") || strings.Contains(message, "must be text") || strings.Contains(message, "must be boolean"):
+		return "PARAMETER_TYPE_MISMATCH"
+	default:
+		return "PARAMETER_EVALUATION_FAILED"
+	}
+}
+
+func truncateFailureMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) > 2000 {
+		return message[:2000]
+	}
+	return message
 }
 
 func writeParameterLimitRejection(w http.ResponseWriter, runID string, model control.Model, resolveErr error) bool {
@@ -825,14 +886,17 @@ func (s *server) recentRuns(w http.ResponseWriter, r *http.Request) {
 	result := make([]map[string]interface{}, 0, len(runs))
 	for _, run := range runs {
 		summary := fmt.Sprintf("%d outputs", len(run.Outputs))
-		if len(run.Outputs) > 0 {
+		if run.FailureMessage != "" {
+			summary = run.FailureMessage
+		} else if len(run.Outputs) > 0 {
 			summary = fmt.Sprintf("%s = %v %s", run.Outputs[0].Parameter, run.Outputs[0].Value, run.Outputs[0].Unit)
 		}
 		result = append(result, map[string]interface{}{
 			"id": run.RunID, "task": recentRunTask(run.Context),
 			"model": fmt.Sprintf("%s · Rev %d", modelNames[run.ModelID], run.ModelRevision), "modelId": run.ModelID,
 			"familyId": run.FamilyID, "status": run.Status, "parameters": run.Parameters, "outputs": run.Outputs,
-			"reason": summary, "time": run.PreparedAt,
+			"reason": summary, "time": run.PreparedAt, "requestId": run.RequestID,
+			"failureCode": run.FailureCode, "failureMessage": run.FailureMessage,
 		})
 	}
 	write(w, 200, result)
@@ -889,8 +953,9 @@ func (s *server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var completion struct {
-		Status   string                 `json:"status"`
-		Feedback map[string]interface{} `json:"feedback,omitempty"`
+		Status         string                 `json:"status"`
+		Feedback       map[string]interface{} `json:"feedback,omitempty"`
+		FailureMessage string                 `json:"failureMessage,omitempty"`
 	}
 	if err := decode(r, &completion); err != nil {
 		write(w, 400, map[string]string{"error": err.Error()})
@@ -947,7 +1012,16 @@ func (s *server) complete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		if err := s.store.CompleteRun(runID, status, feedback, updates); err != nil {
+		failureCode := ""
+		failureMessage := ""
+		if completion.Status == "failed" {
+			failureCode = "EXTERNAL_PROCESS_FAILED"
+			failureMessage = truncateFailureMessage(completion.FailureMessage)
+			if failureMessage == "" {
+				failureMessage = "The external application reported that processing failed."
+			}
+		}
+		if err := s.store.CompleteRun(runID, status, feedback, updates, failureCode, failureMessage); err != nil {
 			write(w, 409, map[string]string{"error": err.Error()})
 			return
 		}
@@ -973,16 +1047,44 @@ func (s *server) revisions(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[2]
 	action := parts[3]
-	if action == "retire" && r.Method == "POST" {
+	if action == "deactivate" && r.Method == "POST" {
 		if !s.requireRole(w, r, "admin") {
 			return
 		}
-		retired, err := s.store.RetireFamily(id)
+		deactivated, err := s.store.DeactivateFamily(id)
 		if err != nil {
 			write(w, 409, map[string]string{"error": err.Error()})
 			return
 		}
-		write(w, 200, retired)
+		write(w, 200, deactivated)
+		return
+	}
+	if action == "reactivate" && r.Method == "POST" {
+		if !s.requireRole(w, r, "admin") {
+			return
+		}
+		var request struct {
+			Reason string `json:"reason"`
+		}
+		if err := decode(r, &request); err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		request.Reason = strings.TrimSpace(request.Reason)
+		if request.Reason == "" {
+			write(w, 400, map[string]string{"error": "reactivation reason is required"})
+			return
+		}
+		reactivated, err := s.store.ReactivateFamily(id)
+		if err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		current, _ := s.currentUser(r)
+		if err := s.store.RecordAudit(actorID(current), "model.reactivated", "success", "model_family", reactivated.FamilyID, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), map[string]interface{}{"modelId": reactivated.ID, "revision": reactivated.Revision, "reason": request.Reason}); err != nil {
+			operationalLog("ERROR", "model_reactivation_audit_failed", map[string]interface{}{"familyId": reactivated.FamilyID, "error": err.Error()})
+		}
+		write(w, 200, reactivated)
 		return
 	}
 	if action == "purge-summary" && r.Method == "GET" {
