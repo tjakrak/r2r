@@ -633,6 +633,15 @@ type ExpressionReference = {
   source: string;
   plain?: boolean;
   kind?: 'value' | 'sample' | 'sample-column';
+  dataType?: 'string' | 'number' | 'boolean';
+  description?: string;
+  definition?: string;
+  definitionLabel?: string;
+  unit?: string;
+};
+type ExpressionExplanation = {
+  summary: string;
+  sections: { label: string; lines: string[] }[];
 };
 
 const functionHelp: Record<string, { signature: string; description: string }> = {
@@ -735,66 +744,6 @@ function formatExpression(expression: string) {
     }
   });
   return output.trim();
-}
-
-function splitExpressionArguments(value: string) {
-  const parts: string[] = [];
-  let start = 0;
-  let depth = 0;
-  let quoted = false;
-  for (let index = 0; index < value.length; index++) {
-    const character = value[index];
-    if (character === '"' && value[index - 1] !== '\\') quoted = !quoted;
-    if (quoted) continue;
-    if (character === '(') depth++;
-    else if (character === ')') depth--;
-    else if (character === ',' && depth === 0) {
-      parts.push(value.slice(start, index).trim());
-      start = index + 1;
-    }
-  }
-  parts.push(value.slice(start).trim());
-  return parts;
-}
-
-function outerExpressionCall(value: string) {
-  const trimmed = value.trim();
-  const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-  if (!match || !trimmed.endsWith(')')) return undefined;
-  return { name: match[1].toUpperCase(), args: splitExpressionArguments(trimmed.slice(match[0].length, -1)) };
-}
-
-function readableExpressionValue(value: string): string {
-  const call = outerExpressionCall(value);
-  if (call?.name === 'IF' && call.args.length === 3)
-    return `If ${readableCondition(call.args[0])}, then ${readableExpressionValue(call.args[1])}; otherwise ${readableExpressionValue(call.args[2])}`;
-  if ((call?.name === 'LOOKUP_ONE' || call?.name === 'LOOKUP_FIRST') && call.args.length === 3) {
-    const mode = call.name === 'LOOKUP_ONE' ? 'the single matching row' : 'the first matching row';
-    return `return ${readableReference(call.args[2])} from ${mode} in ${readableReference(call.args[0])} where ${readableCondition(call.args[1])}`;
-  }
-  if (call && call.args.length)
-    return `${call.name.toLowerCase()} of ${call.args.map(readableExpressionValue).join(', ')}`;
-  return readableCondition(value);
-}
-
-function readableReference(value: string) {
-  return value.trim().replace(/^@/, '').replace('.', ' → ').replaceAll('_', ' ');
-}
-
-function readableCondition(value: string) {
-  return value
-    .trim()
-    .replace(/@([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?/g, (_, sample, column) =>
-      column ? `${sample.replaceAll('_', ' ')} → ${column.replaceAll('_', ' ')}` : sample.replaceAll('_', ' '),
-    )
-    .replace(/\s*==\s*/g, ' equals ')
-    .replace(/\s*!=\s*/g, ' does not equal ')
-    .replace(/\s*>=\s*/g, ' is at least ')
-    .replace(/\s*<=\s*/g, ' is at most ')
-    .replace(/\s*>\s*/g, ' is greater than ')
-    .replace(/\s*<\s*/g, ' is less than ')
-    .replace(/\bAND\b/gi, 'and')
-    .replace(/\bOR\b/gi, 'or');
 }
 
 function expressionItemDescription(label: string, template: string) {
@@ -907,9 +856,14 @@ function ExpressionPopupEditor({
   const [draft, setDraft] = useState(value);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [category, setCategory] = useState<string>(expressionGroups[0].name);
+  const [explanation, setExplanation] = useState<ExpressionExplanation>();
+  const [explanationLoading, setExplanationLoading] = useState(false);
+  const [explanationError, setExplanationError] = useState('');
   const begin = () => {
     setDraft(value);
     setPreviewOpen(false);
+    setExplanation(undefined);
+    setExplanationError('');
     setOpen(true);
   };
   const insert = (template: string) => {
@@ -929,7 +883,65 @@ function ExpressionPopupEditor({
     });
   };
   const group = expressionGroups.find((item) => item.name === category) || expressionGroups[0];
-  const explanation = draft.trim() ? readableExpressionValue(draft) : '';
+  useEffect(() => {
+    if (!open || !previewOpen || !draft.trim()) {
+      setExplanationLoading(false);
+      setExplanationError('');
+      setExplanation(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setExplanationLoading(true);
+      setExplanationError('');
+      try {
+        const response = await fetch(appPath('/api/expressions/explain'), {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ expression: draft }),
+          signal: controller.signal,
+        });
+        const text = await response.text();
+        let result: any = {};
+        try {
+          result = text ? JSON.parse(text) : {};
+        } catch {
+          throw new Error(`Expression explanation returned HTTP ${response.status} with an invalid response.`);
+        }
+        if (!response.ok) throw new Error(result.error || `Expression explanation failed with HTTP ${response.status}.`);
+        setExplanation(result as ExpressionExplanation);
+      } catch (reason) {
+        if ((reason as Error).name !== 'AbortError') {
+          setExplanation(undefined);
+          setExplanationError((reason as Error).message);
+        }
+      } finally {
+        if (!controller.signal.aborted) setExplanationLoading(false);
+      }
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, previewOpen, draft]);
+  const referenceByName = new Map(
+    references
+      .filter((reference) => !reference.plain)
+      .map((reference) => [reference.name.toLowerCase(), reference]),
+  );
+  const usedReferences = Array.from(
+    draft.matchAll(/@([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)/g),
+  ).reduce<ExpressionReference[]>((used, match) => {
+    const name = match[1];
+    const reference =
+      referenceByName.get(name.toLowerCase()) ||
+      referenceByName.get(name.split('.')[0].toLowerCase());
+    if (reference && !used.some((item) => item.name.toLowerCase() === reference.name.toLowerCase())) {
+      used.push(reference);
+    }
+    return used;
+  }, []);
   return (
     <>
       <div className="expression-field">
@@ -1026,15 +1038,66 @@ function ExpressionPopupEditor({
                       onClick={() => setPreviewOpen((current) => !current)}
                     >
                       <span>
-                        <strong>Plain-language preview</strong>
-                        <small>Readable explanation of the current expression</small>
+                        <strong>Expression explanation</strong>
+                        <small>Plain-language summary and referenced definitions</small>
                       </span>
                       <ChevronDown />
                     </button>
                     {previewOpen && (
                       <div className="expression-preview-body">
-                        <p>{explanation || 'Enter an expression to see a readable explanation.'}</p>
-                        <small>This preview is explanatory; the expression above is executed.</small>
+                        {!draft.trim() && <p>Enter an expression to see a structured explanation.</p>}
+                        {explanationLoading && <p className="expression-explanation-loading">Explaining expression…</p>}
+                        {explanationError && <p className="expression-explanation-error">{explanationError}</p>}
+                        {explanation && !explanationLoading && (
+                          <div className="expression-structured-explanation">
+                            <p>{explanation.summary}</p>
+                            {explanation.sections.map((section) => (
+                              <section key={section.label}>
+                                <h6>{section.label}</h6>
+                                <ul>
+                                  {section.lines.map((line, index) => <li key={index}>{line}</li>)}
+                                </ul>
+                              </section>
+                            ))}
+                          </div>
+                        )}
+                        {draft.trim() && (
+                          <div className="expression-reference-summary">
+                            <h5>
+                              References used <span>{usedReferences.length}</span>
+                            </h5>
+                            {usedReferences.length ? (
+                              <div className="expression-reference-list">
+                                {usedReferences.map((reference) => (
+                                  <article key={`${reference.source}:${reference.name}`}>
+                                    <header>
+                                      <code>@{reference.name}</code>
+                                      <span>
+                                        {reference.dataType || reference.source}
+                                        {reference.unit ? ` · ${reference.unit}` : ''}
+                                      </span>
+                                    </header>
+                                    <small>{reference.source}</small>
+                                    {reference.description && <p>{reference.description}</p>}
+                                    {reference.definition ? (
+                                      <div>
+                                        <b>{reference.definitionLabel || 'Definition'}</b>
+                                        <code>{reference.definition}</code>
+                                      </div>
+                                    ) : (
+                                      <p className="runtime-reference">Provided at runtime.</p>
+                                    )}
+                                  </article>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="runtime-reference">
+                                No declared model references are used by this expression.
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        <small>This explanation is informational; the expression above is executed.</small>
                       </div>
                     )}
                   </div>
@@ -4934,17 +4997,37 @@ function ParameterSourceEditor({
           references={[
             ...resultParameters
               .filter((item) => item.key && item.key !== parameter.key)
-              .map((item) => ({ name: item.key, source: 'Parameter' })),
+              .map((item) => ({
+                name: item.key,
+                source: `Parameter · ${item.source}`,
+                dataType: item.dataType || ('number' as const),
+                description: item.description,
+                definition: item.definition,
+                definitionLabel: item.source === 'constant' ? 'Value' : 'Definition',
+                unit: item.unit,
+              })),
             ...externalInputs
               .filter((item) => item.name)
-              .map((item) => ({ name: item.name, source: 'External input' })),
-            ...Object.keys(indexes).map((name) => ({ name, source: 'Model index' })),
+              .map((item) => ({
+                name: item.name,
+                source: 'External input',
+                dataType: item.type,
+                description: item.description,
+              })),
+            ...Object.keys(indexes).map((name) => ({
+              name,
+              source: 'Model index',
+              dataType: 'string' as const,
+            })),
             { name: 'true', source: 'Boolean value', plain: true },
             { name: 'false', source: 'Boolean value', plain: true },
             ...samples.map((sample) => ({
               name: sample.key,
-              source: 'Data sample',
+              source: `Data sample · ${sample.source}`,
               kind: 'sample' as const,
+              description: sample.description,
+              definition: sample.source === 'sql' ? sample.query : `${sample.rows?.length || 0} static rows`,
+              definitionLabel: sample.source === 'sql' ? 'SQL query' : 'Data',
             })),
             ...samples.flatMap((sample) =>
               (sample.columns || [])
@@ -4957,6 +5040,9 @@ function ParameterSourceEditor({
                   name: `${sample.key}.${column.name}`,
                   source: `Data sample column · ${column.type}`,
                   kind: 'sample-column' as const,
+                  dataType: column.type,
+                  description: sample.description,
+                  definition: `Column ${column.name} from @${sample.key}`,
                 })),
             ),
             ...[

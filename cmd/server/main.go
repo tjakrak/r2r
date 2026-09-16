@@ -554,6 +554,25 @@ func (s *server) dependencies(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, graph)
 }
+func (s *server) explainExpression(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		write(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var request struct {
+		Expression string `json:"expression"`
+	}
+	if err := decode(r, &request); err != nil {
+		write(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	explanation, err := control.ExplainExpression(request.Expression)
+	if err != nil {
+		write(w, 422, map[string]string{"error": "expression cannot be explained until its syntax is valid: " + err.Error()})
+		return
+	}
+	write(w, 200, explanation)
+}
 func (s *server) refactorParameter(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		write(w, 405, map[string]string{"error": "method not allowed"})
@@ -2531,6 +2550,7 @@ func main() {
 	mux.HandleFunc("/api/logout", s.logout)
 	mux.HandleFunc("/api/config", s.authenticated(s.config))
 	mux.HandleFunc("/api/dependencies", s.authenticated(s.dependencies))
+	mux.HandleFunc("/api/expressions/explain", s.authenticated(s.explainExpression))
 	mux.HandleFunc("/api/parameters/refactor", s.authenticated(s.refactorParameter))
 	mux.HandleFunc("/api/v1/runs/prepare", s.prepare)
 	mux.HandleFunc("/api/v1/runs/", s.complete)
