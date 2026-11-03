@@ -1,10 +1,11 @@
-import { type ChangeEvent, useEffect, useMemo, useState } from 'react';
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BookOpen,
   Check,
   CircleAlert,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Clock3,
   Code2,
@@ -13,11 +14,14 @@ import {
   Download,
   FileClock,
   FlaskConical,
+  Folder,
+  FolderOpen,
   Gauge,
   GitBranch,
   LogOut,
   LoaderCircle,
   Menu,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -147,6 +151,7 @@ const newSource = (): Source => ({
 type Model = {
   id: string;
   familyId: string;
+  folderId?: string;
   name: string;
   owner: string;
   revision: number;
@@ -171,6 +176,15 @@ type Model = {
   outputs: string[];
   enabled: boolean;
 };
+type ModelFolder = {
+  id: string;
+  name: string;
+  description?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedBy: string;
+  updatedAt: string;
+};
 type ConfigUser = {
   employeeId: string;
   loginId: string;
@@ -178,7 +192,7 @@ type ConfigUser = {
   role: User['role'];
   status: 'active' | 'disabled';
 };
-type Config = { models: Model[]; sources: Source[]; inputDefinitions: InputDefinition[]; users?: ConfigUser[] };
+type Config = { models: Model[]; folders?: ModelFolder[]; sources: Source[]; inputDefinitions: InputDefinition[]; users?: ConfigUser[] };
 type ActivityRow = {
   id: string;
   task: string;
@@ -315,6 +329,7 @@ export default function App() {
   const [mobile, setMobile] = useState(false);
   const [selected, setSelected] = useState<Model>();
   const [importingModel, setImportingModel] = useState(false);
+  const [importFolderId, setImportFolderId] = useState('');
   const [editingSource, setEditingSource] = useState<Source>();
   const [editingInput, setEditingInput] = useState<InputDefinition>();
   const [user, setUser] = useState<User>();
@@ -638,13 +653,16 @@ export default function App() {
         {view === 'models' && (
           <ControlModels
             models={controlModels}
+            folders={config?.folders || []}
             registeredUsers={config?.users || []}
+            role={user.role}
             canCreate={
               user.role === 'engineer' || user.role === 'engineering_manager' || user.role === 'admin'
             }
-            onCreate={() => setSelected(newModel())}
-            onImport={() => setImportingModel(true)}
+            onCreate={(folderId) => setSelected({ ...newModel(), folderId })}
+            onImport={(folderId) => { setImportFolderId(folderId); setImportingModel(true); }}
             onOpen={setSelected}
+            onChanged={load}
           />
         )}
         {view === 'simulation' && (
@@ -728,10 +746,12 @@ export default function App() {
       {selected && (
         <ModelDrawer
           model={selected}
+          folders={config?.folders || []}
           sources={config?.sources || []}
           inputDefinitions={config?.inputDefinitions || []}
           registeredUsers={config?.users || []}
           role={user.role}
+          currentEmployeeId={user.employeeId}
           onClose={() => setSelected(undefined)}
           onChanged={async () => {
             await load();
@@ -741,6 +761,8 @@ export default function App() {
       )}
       {importingModel && (
         <ModelImportDialog
+          folders={config?.folders || []}
+          initialFolderId={importFolderId}
           onClose={() => setImportingModel(false)}
           onImported={async (model) => {
             await load();
@@ -775,23 +797,33 @@ export default function App() {
 
 function ControlModels({
   models,
+  folders,
   registeredUsers,
+  role,
   canCreate,
   onCreate,
   onImport,
   onOpen,
+  onChanged,
 }: {
   models: Model[];
+  folders: ModelFolder[];
   registeredUsers: ConfigUser[];
+  role: User['role'];
   canCreate: boolean;
-  onCreate: () => void;
-  onImport: () => void;
+  onCreate: (folderId: string) => void;
+  onImport: (folderId: string) => void;
   onOpen: (model: Model) => void;
+  onChanged: () => Promise<void>;
 }) {
   const [search, setSearch] = useState('');
   const [machine, setMachine] = useState('');
   const [action, setAction] = useState('');
   const [material, setMaterial] = useState('');
+  const [selectedFolder, setSelectedFolder] = useState('all');
+  const [folderDialog, setFolderDialog] = useState<ModelFolder | null>();
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 50;
 
   const indexValues = (model: Model, key: string) =>
     Object.entries(model.indexes).find(([name]) => name.toLowerCase() === key)?.[1] || [];
@@ -807,19 +839,32 @@ function ControlModels({
     const query = search.trim().toLocaleLowerCase();
     return models.filter(
       (model) =>
+        (selectedFolder === 'all' || (model.folderId || '') === selectedFolder) &&
         (!query || model.name.toLocaleLowerCase().includes(query)) &&
         (!machine || indexValues(model, 'machine').includes(machine)) &&
         (!action || indexValues(model, 'action').includes(action)) &&
         (!material || indexValues(model, 'material').includes(material)),
     );
-  }, [models, search, machine, action, material]);
+  }, [models, selectedFolder, search, machine, action, material]);
+  const totalPages = Math.max(1, Math.ceil(filteredModels.length / pageSize));
+  const activePage = Math.min(currentPage, totalPages);
+  const pageStart = (activePage - 1) * pageSize;
+  const pagedModels = filteredModels.slice(pageStart, pageStart + pageSize);
+  useEffect(
+    () => setCurrentPage((page) => Math.min(page, totalPages)),
+    [totalPages],
+  );
   const hasFilters = Boolean(search || machine || action || material);
   const clearFilters = () => {
     setSearch('');
     setMachine('');
     setAction('');
     setMaterial('');
+    setCurrentPage(1);
   };
+  const currentFolderId = selectedFolder === 'all' ? '' : selectedFolder;
+  const selectFolder = (folderId: string) => { setSelectedFolder(folderId); setCurrentPage(1); };
+  const folderCount = (folderId: string) => models.filter((model) => (model.folderId || '') === folderId).length;
 
   return (
     <section className="page">
@@ -830,11 +875,11 @@ function ControlModels({
         action={
           canCreate ? (
             <div className="page-title-actions">
-              <button className="secondary" onClick={onImport}>
+              <button className="secondary" onClick={() => onImport(currentFolderId)}>
                 <Upload />
                 Import JSON
               </button>
-              <button className="primary" onClick={onCreate}>
+              <button className="primary" onClick={() => onCreate(currentFolderId)}>
                 <Plus />
                 Create model
               </button>
@@ -842,68 +887,221 @@ function ControlModels({
           ) : undefined
         }
       />
-      <section className="model-filters" aria-label="Filter control models">
-        <label className="model-search">
-          <Search aria-hidden="true" />
-          <span className="sr-only">Search by model name</span>
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search model name"
-          />
-        </label>
-        <div className="model-filter-selects">
-          <FilterSelect label="Machine" value={machine} options={machines} onChange={setMachine} />
-          <FilterSelect label="Action" value={action} options={actions} onChange={setAction} />
-          <FilterSelect
-            label="Material"
-            value={material}
-            options={materials}
-            onChange={setMaterial}
-          />
-        </div>
-        <div className="model-filter-summary">
-          <span>
-            {filteredModels.length} of {models.length} models
-          </span>
-          {hasFilters && (
-            <button type="button" onClick={clearFilters}>
-              <X />
-              Clear filters
-            </button>
+      <div className="model-library">
+        <aside className="model-folder-panel" aria-label="Model folders">
+          <div className="model-folder-heading">
+            <FolderOpen />
+            <strong>Model folders</strong>
+            {canCreate && (
+              <button type="button" className="icon" title="Add folder" aria-label="Add folder" onClick={() => setFolderDialog(null)}><Plus /></button>
+            )}
+          </div>
+          <div className="model-folder-fixed">
+            <button type="button" className={selectedFolder === 'all' ? 'active' : ''} onClick={() => selectFolder('all')}><FolderOpen /><span>All models</span><small>{models.length}</small></button>
+            <button type="button" className={selectedFolder === '' ? 'active' : ''} onClick={() => selectFolder('')}><Folder /><span>Unfiled</span><small>{folderCount('')}</small></button>
+          </div>
+          <div className="model-folder-scroll">
+            {folders.map((folder) => (
+              <button type="button" key={folder.id} className={selectedFolder === folder.id ? 'active' : ''} onClick={() => selectFolder(folder.id)} title={folder.description || folder.name}>
+                <Folder /><span>{folder.name}</span><small>{folderCount(folder.id)}</small>
+              </button>
+            ))}
+          </div>
+          {selectedFolder !== 'all' && selectedFolder !== '' && canCreate && (
+            <button type="button" className="model-folder-edit" onClick={() => setFolderDialog(folders.find((folder) => folder.id === selectedFolder))}><Pencil /> Edit folder</button>
           )}
-        </div>
+        </aside>
+        <div className="model-library-content">
+      <section className="model-filters" aria-label="Filter control models">
+            <label className="model-search">
+              <Search aria-hidden="true" />
+              <span className="sr-only">Search by model name</span>
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setCurrentPage(1);
+                }}
+                placeholder="Search model name"
+              />
+            </label>
+            <div className="model-filter-selects">
+              <FilterSelect
+                label="Machine"
+                value={machine}
+                options={machines}
+                onChange={(value) => {
+                  setMachine(value);
+                  setCurrentPage(1);
+                }}
+              />
+              <FilterSelect
+                label="Action"
+                value={action}
+                options={actions}
+                onChange={(value) => {
+                  setAction(value);
+                  setCurrentPage(1);
+                }}
+              />
+              <FilterSelect
+                label="Material"
+                value={material}
+                options={materials}
+                onChange={(value) => {
+                  setMaterial(value);
+                  setCurrentPage(1);
+                }}
+              />
+            </div>
+            <div className="model-filter-summary">
+              <span>
+                {filteredModels.length} of {selectedFolder === 'all' ? models.length : folderCount(currentFolderId)} models
+              </span>
+              {hasFilters && (
+                <button type="button" onClick={clearFilters}>
+                  <X />
+                  Clear filters
+                </button>
+              )}
+            </div>
       </section>
       {filteredModels.length ? (
-        <div className="model-list">
-          {filteredModels.map((model) => (
-            <ModelRow
-              key={model.id}
-              model={model}
-              ownerInactive={
-                Boolean(model.owner) &&
-                !registeredUsers.some(
-                  (registered) =>
-                    registered.employeeId.toLowerCase() === model.owner.toLowerCase() &&
-                    registered.status === 'active',
-                )
-              }
-              onOpen={() => onOpen(model)}
-            />
-          ))}
+            <>
+              <div className="model-list">
+                {pagedModels.map((model) => (
+                  <ModelRow
+                    key={model.id}
+                    model={model}
+                    ownerInactive={
+                      Boolean(model.owner) &&
+                      !registeredUsers.some(
+                        (registered) =>
+                          registered.employeeId.toLowerCase() === model.owner.toLowerCase() &&
+                          registered.status === 'active',
+                      )
+                    }
+                    onOpen={() => onOpen(model)}
+                  />
+                ))}
+              </div>
+              {totalPages > 1 && (
+                <nav className="model-pagination" aria-label="Control model pages">
+                  <span aria-live="polite">
+                    Showing {pageStart + 1}–{Math.min(pageStart + pageSize, filteredModels.length)} of{' '}
+                    {filteredModels.length}
+                  </span>
+                  <div>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={activePage === 1}
+                      onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+                    >
+                      <ChevronLeft />
+                      Previous
+                    </button>
+                    <strong>
+                      Page {activePage} of {totalPages}
+                    </strong>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={activePage === totalPages}
+                      onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
+                    >
+                      Next
+                      <ChevronRight />
+                    </button>
+                  </div>
+                </nav>
+              )}
+            </>
+          ) : (
+            <div className="model-filter-empty">
+              <SlidersHorizontal />
+              <strong>No matching control models</strong>
+              <p>{selectedFolder !== 'all' && !hasFilters ? 'This folder has no models yet.' : 'Adjust the model name or index filters to see more results.'}</p>
+              {hasFilters && <button className="secondary" onClick={clearFilters}>Clear filters</button>}
+              {canCreate && selectedFolder !== 'all' && !hasFilters && <button className="primary" onClick={() => onCreate(currentFolderId)}><Plus /> Create model here</button>}
+            </div>
+      )}
         </div>
-      ) : (
-        <div className="model-filter-empty">
-          <SlidersHorizontal />
-          <strong>No matching control models</strong>
-          <p>Adjust the model name or index filters to see more results.</p>
-          <button className="secondary" onClick={clearFilters}>
-            Clear filters
-          </button>
-        </div>
+      </div>
+      {folderDialog !== undefined && (
+        <ModelFolderDialog
+          folder={folderDialog}
+          canDelete={role === 'admin'}
+          modelCount={folderDialog ? folderCount(folderDialog.id) : 0}
+          onClose={() => setFolderDialog(undefined)}
+          onSaved={async (folderId) => { await onChanged(); selectFolder(folderId); setFolderDialog(undefined); }}
+        />
       )}
     </section>
+  );
+}
+
+function ModelFolderDialog({
+  folder,
+  canDelete,
+  modelCount,
+  onClose,
+  onSaved,
+}: {
+  folder: ModelFolder | null;
+  canDelete: boolean;
+  modelCount: number;
+  onClose: () => void;
+  onSaved: (folderId: string) => Promise<void>;
+}) {
+  const [name, setName] = useState(folder?.name || '');
+  const [description, setDescription] = useState(folder?.description || '');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const save = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const saved = await api<ModelFolder>(folder ? `/api/model-folders/${folder.id}` : '/api/model-folders', {
+        method: folder ? 'PUT' : 'POST',
+        body: JSON.stringify({ name: name.trim(), description: description.trim() }),
+      });
+      await onSaved(saved.id);
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async () => {
+    if (!folder || !window.confirm(`Permanently delete the empty folder “${folder.name}”?`)) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api(`/api/model-folders/${folder.id}`, { method: 'DELETE' });
+      await onSaved('all');
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="payload-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="add-user-dialog model-folder-dialog" role="dialog" aria-modal="true" aria-label={folder ? 'Edit model folder' : 'Add model folder'}>
+        <header><div><p>MODEL LIBRARY</p><h3>{folder ? 'Edit folder' : 'Add folder'}</h3></div><button className="icon" onClick={onClose} aria-label="Close folder dialog"><X /></button></header>
+        <label>Folder name <input value={name} onChange={(event) => setName(event.target.value)} maxLength={200} autoFocus /></label>
+        <label>Description (optional) <input value={description} onChange={(event) => setDescription(event.target.value)} maxLength={1000} /></label>
+        {folder && <p>{modelCount ? `${modelCount} model${modelCount === 1 ? '' : 's'} in this folder. Move them before deleting it.` : 'This folder is empty and can be deleted.'}</p>}
+        {error && <p className="error">{error}</p>}
+        <footer>
+          {folder && canDelete && <button type="button" className="danger" onClick={remove} disabled={busy || modelCount > 0}>Delete folder</button>}
+          <button type="button" className="secondary" onClick={onClose} disabled={busy}>Cancel</button>
+          <button type="button" className="primary" onClick={save} disabled={busy || !name.trim()}>{busy ? 'Saving…' : folder ? 'Save folder' : 'Add folder'}</button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -932,11 +1130,16 @@ const modelImportExample = `{
 function ModelImportDialog({
   onClose,
   onImported,
+  folders,
+  initialFolderId,
 }: {
   onClose: () => void;
   onImported: (model: Model) => Promise<void>;
+  folders: ModelFolder[];
+  initialFolderId: string;
 }) {
   const [definition, setDefinition] = useState(modelImportExample);
+  const [folderId, setFolderId] = useState(initialFolderId);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -967,7 +1170,7 @@ function ModelImportDialog({
     }
     setBusy(true);
     try {
-      const created = await api<Model>('/api/models/import', {
+      const created = await api<Model>(`/api/models/import?folderId=${encodeURIComponent(folderId)}`, {
         method: 'POST',
         body: JSON.stringify(parsed),
       });
@@ -999,6 +1202,13 @@ function ModelImportDialog({
           JSON before R2R validates it and creates a new draft. IDs, revision, ownership, status,
           and approval fields are ignored.
         </p>
+        <label>
+          Folder
+          <select value={folderId} onChange={(event) => setFolderId(event.target.value)}>
+            <option value="">Unfiled</option>
+            {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+          </select>
+        </label>
         <div className="model-import-source">
           <span>Import source</span>
           <label className="secondary" htmlFor="model-definition-file">
@@ -1333,6 +1543,56 @@ function Documentation() {
               configured output.
             </p>
             <pre>{prepareExample}</pre>
+            <p>
+              When the indexes are valid but no approved model matches them, prepare returns a
+              normal <code>no_match</code> outcome with disposition{' '}
+              <code>no_control_recommendation</code> and an empty output list. No run ID is created;
+              the external application can apply its configured fallback behavior.
+            </p>
+            <h3>Prepare response guide</h3>
+            <div className="documentation-table execution-response-table">
+              <div className="documentation-table-head">
+                <span>HTTP / status</span>
+                <span>Meaning</span>
+                <span>Caller action</span>
+              </div>
+              <div>
+                <strong>200 · prepared</strong>
+                <span>A model matched and its outputs were saved with a new run ID.</span>
+                <span>Use the outputs and complete the run afterward.</span>
+              </div>
+              <div>
+                <strong>200 · no_match</strong>
+                <span>Indexes were valid, but no enabled approved model matched.</span>
+                <span>Do not complete. Apply the application's approved fallback policy.</span>
+              </div>
+              <div>
+                <strong>422 · rejected</strong>
+                <span>A configured parameter limit rejected the selected model result.</span>
+                <span>Do not process or complete; surface the reported violation.</span>
+              </div>
+              <div>
+                <strong>400 / 422</strong>
+                <span>The JSON, indexes, external inputs, or model routing were invalid.</span>
+                <span>Correct the request or model configuration. No completion is required.</span>
+              </div>
+              <div>
+                <strong>409</strong>
+                <span>The unfinished-run limit was reached or prepared state could not be committed.</span>
+                <span>Do not process. Resolve the open run or persistence conflict.</span>
+              </div>
+              <div>
+                <strong>500 / 501</strong>
+                <span>R2R could not persist required state or execute a required capability.</span>
+                <span>Treat as a system failure and retain the response X-Request-ID.</span>
+              </div>
+            </div>
+            <div className="documentation-note">
+              Only <code>status: prepared</code> creates an open run that the caller must complete.
+              Never call completion for <code>no_match</code>, a rejected result, simulation, or a
+              request error. An output value can be <code>null</code>; do not silently convert it to
+              zero, empty text, or false.
+            </div>
             <h3>2. Complete the run</h3>
             <p>
               Every prepared run must be completed. When the model declares required post-run
@@ -1340,6 +1600,29 @@ function Documentation() {
               completed without successful feedback.
             </p>
             <pre>{completeExample}</pre>
+            <h3>Completion outcomes</h3>
+            <div className="documentation-table execution-response-table">
+              <div className="documentation-table-head">
+                <span>Request</span>
+                <span>Stored status</span>
+                <span>Meaning</span>
+              </div>
+              <div>
+                <strong>succeeded</strong>
+                <span><code>completed</code></span>
+                <span>Feedback was accepted and eligible adaptive updates were applied.</span>
+              </div>
+              <div>
+                <strong>failed</strong>
+                <span><code>run_failed</code></span>
+                <span>The external process failed; include a sanitized failure message.</span>
+              </div>
+              <div>
+                <strong>cancelled</strong>
+                <span><code>run_cancelled</code></span>
+                <span>The external application cancelled the physical process.</span>
+              </div>
+            </div>
             <div className="documentation-note">
               A prepare request remains unfinished until completion succeeds. The model execution
               policy may limit how many unfinished runs are allowed for each configured partition,
@@ -1407,6 +1690,7 @@ function FilterSelect({
           </option>
         ))}
       </select>
+      <ChevronDown aria-hidden="true" />
     </label>
   );
 }
@@ -3116,6 +3400,176 @@ function ModelRow({ model, ownerInactive, onOpen }: { model: Model; ownerInactiv
   );
 }
 
+type RevisionChange = { label: string; before: unknown; after: unknown; kind: 'added' | 'removed' | 'changed' };
+type RevisionChangeSection = { title: string; changes: RevisionChange[] };
+
+function sameRevisionValue(left: unknown, right: unknown): boolean {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, item]) => [key, canonical(item)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
+function revisionChanges(current: Model, previous?: Model): RevisionChangeSection[] {
+  const sections: RevisionChangeSection[] = [];
+  const section = (title: string) => {
+    const result: RevisionChangeSection = { title, changes: [] };
+    sections.push(result);
+    return result;
+  };
+  const add = (target: RevisionChangeSection, label: string, before: unknown, after: unknown) => {
+    if (sameRevisionValue(before, after)) return;
+    target.changes.push({
+      label, before, after,
+      kind: before === undefined ? 'added' : after === undefined ? 'removed' : 'changed',
+    });
+  };
+  const compareMap = (target: RevisionChangeSection, before: Record<string, unknown>, after: Record<string, unknown>) => {
+    for (const key of [...new Set([...Object.keys(before), ...Object.keys(after)])].sort()) {
+      add(target, key, before[key], after[key]);
+    }
+  };
+  const keyed = <T extends object>(items: T[] | undefined, key: keyof T): Record<string, T> =>
+    Object.fromEntries((items || []).map((item) => [String(item[key]), item]));
+  const compareEntities = <T extends object>(
+    target: RevisionChangeSection, beforeItems: T[] | undefined, afterItems: T[] | undefined,
+    key: keyof T, excludedFields: string[] = [],
+  ) => {
+    const before = keyed(beforeItems, key);
+    const after = keyed(afterItems, key);
+    for (const name of [...new Set([...Object.keys(before), ...Object.keys(after)])].sort()) {
+      if (!before[name] || !after[name]) {
+        add(target, name, before[name], after[name]);
+        continue;
+      }
+      const oldFields = before[name] as Record<string, unknown>;
+      const newFields = after[name] as Record<string, unknown>;
+      for (const field of [...new Set([...Object.keys(oldFields), ...Object.keys(newFields)])].sort()) {
+        if (field === key || excludedFields.includes(field)) continue;
+        add(target, `${name} · ${field}`, oldFields[field], newFields[field]);
+      }
+    }
+  };
+
+  const details = section('Model details');
+  add(details, 'Name', previous?.name, current.name);
+  add(details, 'Description', previous?.description, current.description);
+  const indexes = section('Routing indexes');
+  compareMap(indexes, previous?.indexes || {}, current.indexes || {});
+  const external = section('External inputs');
+  compareEntities(external, previous?.externalInputs, current.externalInputs, 'name');
+  const feedback = section('Feedback inputs');
+  compareEntities(feedback, previous?.feedbackInputs, current.feedbackInputs, 'name');
+  const parameters = section('Parameters');
+  compareEntities(parameters, previous?.parameters, current.parameters, 'key', ['lsl', 'usl', 'limitAction', 'fallbackValue', 'adaptive']);
+  const limits = section('Parameter limits');
+  const adaptive = section('Adaptive controls');
+  const oldParameters = keyed(previous?.parameters, 'key');
+  const newParameters = keyed(current.parameters, 'key');
+  for (const name of [...new Set([...Object.keys(oldParameters), ...Object.keys(newParameters)])].sort()) {
+    if (!oldParameters[name] || !newParameters[name]) continue;
+    for (const field of ['lsl', 'usl', 'limitAction', 'fallbackValue'] as const) {
+      add(limits, `${name} · ${field}`, oldParameters[name][field], newParameters[name][field]);
+    }
+    add(adaptive, name, oldParameters[name].adaptive, newParameters[name].adaptive);
+  }
+  const samples = section('Data samples');
+  compareEntities(samples, previous?.dataSamples, current.dataSamples, 'key');
+  const outputs = section('Outputs');
+  add(outputs, 'Returned parameters (in order)', previous?.outputs, current.outputs);
+  const policy = section('Execution policy');
+  add(policy, 'Maximum unfinished runs', previous?.executionPolicy?.maxUnfinishedRuns, current.executionPolicy?.maxUnfinishedRuns);
+  add(policy, 'Run and adaptive partition', previous?.executionPolicy?.partitionBy, current.executionPolicy?.partitionBy);
+  return sections.filter((item) => item.changes.length > 0);
+}
+
+function revisionValueText(value: unknown): string {
+  if (value === undefined) return 'Not set';
+  if (value === null) return 'NULL';
+  if (typeof value === 'string') return value === '' ? '(empty)' : value;
+  return JSON.stringify(value, null, 2);
+}
+
+function revisionChangedLines(before: string, after: string): [Set<number>, Set<number>] {
+  const oldLines = before.split('\n');
+  const newLines = after.split('\n');
+  const oldChanged = new Set<number>();
+  const newChanged = new Set<number>();
+  if (oldLines.length > 300 || newLines.length > 300) {
+    oldLines.forEach((_, index) => oldChanged.add(index));
+    newLines.forEach((_, index) => newChanged.add(index));
+    return [oldChanged, newChanged];
+  }
+  const longest = Array.from({ length: oldLines.length + 1 }, () => new Uint16Array(newLines.length + 1));
+  for (let old = oldLines.length - 1; old >= 0; old--) {
+    for (let next = newLines.length - 1; next >= 0; next--) {
+      longest[old][next] = oldLines[old] === newLines[next]
+        ? longest[old + 1][next + 1] + 1
+        : Math.max(longest[old + 1][next], longest[old][next + 1]);
+    }
+  }
+  let old = 0;
+  let next = 0;
+  while (old < oldLines.length && next < newLines.length) {
+    if (oldLines[old] === newLines[next]) { old++; next++; }
+    else if (longest[old + 1][next] >= longest[old][next + 1]) oldChanged.add(old++);
+    else newChanged.add(next++);
+  }
+  while (old < oldLines.length) oldChanged.add(old++);
+  while (next < newLines.length) newChanged.add(next++);
+  return [oldChanged, newChanged];
+}
+
+function RevisionDiffValue({ change, side }: { change: RevisionChange; side: 'before' | 'after' }) {
+  const value = side === 'before' ? change.before : change.after;
+  const code = / · (definition|query)$/.test(change.label) && typeof change.before === 'string' && typeof change.after === 'string';
+  if (!code) return <pre>{revisionValueText(value)}</pre>;
+  const changed = revisionChangedLines(change.before as string, change.after as string)[side === 'before' ? 0 : 1];
+  return <pre className="revision-review-code">{(value as string).split('\n').map((line, index) => (
+    <span className={changed.has(index) ? 'changed' : ''} key={index}><i>{index + 1}</i>{line || ' '}</span>
+  ))}</pre>;
+}
+
+function RevisionReviewDialog({ current, previous, onClose }: { current: Model; previous?: Model; onClose: () => void }) {
+  const sections = useMemo(() => revisionChanges(current, previous), [current, previous]);
+  const total = sections.reduce((count, item) => count + item.changes.length, 0);
+  return (
+    <div className="payload-backdrop revision-review-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="revision-review-dialog" role="dialog" aria-modal="true" aria-label={`Review revision ${current.revision} changes`}>
+        <header>
+          <div><p>APPROVAL REVIEW</p><h3>{current.name} · Revision {current.revision}</h3></div>
+          <button type="button" className="icon" onClick={onClose} aria-label="Close review"><X /></button>
+        </header>
+        <p className="revision-review-baseline">{previous ? `Comparing with revision ${previous.revision}${previous.enabled ? ' (currently active)' : ' (most recent approved)'}.` : 'New model: no previously approved revision.'}</p>
+        <div className="revision-review-note"><strong>Author’s change note</strong><p>{current.changeNote || 'No change note provided.'}</p></div>
+        <div className="revision-review-summary"><strong>{total} changed field{total === 1 ? '' : 's'}</strong>{sections.map((item) => <span key={item.title}>{item.title} · {item.changes.length}</span>)}</div>
+        {sections.length ? sections.map((item) => (
+          <details className="revision-review-section" key={item.title} open>
+            <summary>{item.title}<span>{item.changes.length}</span></summary>
+            {item.changes.map((change) => (
+              <article className="revision-review-change" key={change.label}>
+                <div><strong>{change.label}</strong><span className={`revision-review-kind ${change.kind}`}>{change.kind}</span></div>
+                <div className="revision-review-values">
+                  <section><small>BEFORE</small><RevisionDiffValue change={change} side="before" /></section>
+                  <section><small>AFTER</small><RevisionDiffValue change={change} side="after" /></section>
+                </div>
+              </article>
+            ))}
+          </details>
+        )) : <p className="revision-review-empty">No model-definition changes were found. The change note or workflow metadata may have changed.</p>}
+        <footer><button type="button" className="primary" onClick={onClose}>Close review</button></footer>
+      </section>
+    </div>
+  );
+}
+
 function modelEditorForm(
   model: Model,
   sources: Source[],
@@ -3158,18 +3612,22 @@ function modelEditorForm(
 
 function ModelDrawer({
   model,
+  folders,
   sources,
   inputDefinitions,
   registeredUsers,
   role,
+  currentEmployeeId,
   onClose,
   onChanged,
 }: {
   model: Model;
+  folders: ModelFolder[];
   sources: Source[];
   inputDefinitions: InputDefinition[];
   registeredUsers: ConfigUser[];
   role: User['role'];
+  currentEmployeeId: string;
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
@@ -3177,12 +3635,18 @@ function ModelDrawer({
   const [history, setHistory] = useState<Model[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [editing, setEditing] = useState(isNew);
+  const [folderId, setFolderId] = useState(model.folderId || '');
+  const [moveFolderId, setMoveFolderId] = useState(model.folderId || '');
   const [editTarget, setEditTarget] = useState(model);
   const [simulationDraft, setSimulationDraft] = useState<Model>();
+  const [revisionReview, setRevisionReview] = useState<{ current: Model; previous?: Model }>();
+  const [reviewLoadingId, setReviewLoadingId] = useState('');
   const [showDependencies, setShowDependencies] = useState(false);
   const [showPayload, setShowPayload] = useState(false);
   const [payloadView, setPayloadView] = useState<'request' | 'response' | 'contract'>('request');
   const [showHistoryChart, setShowHistoryChart] = useState(false);
+  const [showManageMenu, setShowManageMenu] = useState(false);
+  const manageMenuRef = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
@@ -3193,6 +3657,25 @@ function ModelDrawer({
   const canApprove = role === 'engineering_manager' || role === 'admin';
   const activeRevision = history.find((item) => item.status === 'approved' && item.enabled) ||
     (model.status === 'approved' && model.enabled ? model : undefined);
+  const manageableDraft = history.find((item) => item.status === 'draft') ||
+    (model.status === 'draft' ? model : undefined);
+  const canMoveModel = role === 'admin' || currentModel.owner === currentEmployeeId;
+  useEffect(() => {
+    if (!showManageMenu) return;
+    const dismiss = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent) {
+        if (event.key === 'Escape') setShowManageMenu(false);
+      } else if (!manageMenuRef.current?.contains(event.target as Node)) {
+        setShowManageMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', dismiss);
+    document.addEventListener('keydown', dismiss);
+    return () => {
+      document.removeEventListener('mousedown', dismiss);
+      document.removeEventListener('keydown', dismiss);
+    };
+  }, [showManageMenu]);
   const displayNameFor = (employeeId?: string) => {
     const normalized = employeeId?.trim();
     if (!normalized) return 'Unknown user';
@@ -3290,6 +3773,24 @@ function ModelDrawer({
   const refreshHistory = async () => {
     if (model.id) setHistory(await api<Model[]>(`/api/models/${model.id}/history`));
   };
+  const downloadRevisionJSON = (revision: Model) => {
+    const safeName = (revision.name || revision.familyId || 'model')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'model';
+    const blob = new Blob([`${JSON.stringify(revision, null, 2)}\n`], {
+      type: 'application/json;charset=utf-8',
+    });
+    const downloadURL = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = downloadURL;
+    link.download = `${safeName}-revision-${revision.revision}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(downloadURL), 0);
+  };
   useEffect(() => {
     if (model.id) {
       refreshHistory();
@@ -3314,6 +3815,7 @@ function ModelDrawer({
       const payload = {
         ...editTarget,
         id: '',
+        folderId: isNew ? folderId : editTarget.folderId,
         name: form.name,
         owner: '',
         description: form.description,
@@ -3364,6 +3866,23 @@ function ModelDrawer({
       setActionError((e as Error).message);
     } finally {
       setBusy(false);
+    }
+  };
+  const openRevisionReview = async (revision: Model) => {
+    setReviewLoadingId(revision.id);
+    setActionError('');
+    try {
+      const revisions = await api<Model[]>(`/api/models/${revision.id}/history`);
+      const current = revisions.find((item) => item.id === revision.id);
+      if (!current) throw new Error('The submitted revision is no longer available. Refresh the model and try again.');
+      const previous = revisions.find((item) => item.status === 'approved' && item.enabled && item.revision < current.revision) ||
+        revisions.filter((item) => (item.status === 'approved' || item.status === 'superseded') && item.revision < current.revision)
+          .sort((a, b) => b.revision - a.revision)[0];
+      setRevisionReview({ current, previous });
+    } catch (reason) {
+      setActionError((reason as Error).message);
+    } finally {
+      setReviewLoadingId('');
     }
   };
   const submitForApproval = async (id: string) => {
@@ -3513,6 +4032,18 @@ function ModelDrawer({
       setBusy(false);
     }
   };
+  const moveToFolder = async () => {
+    setBusy(true);
+    setActionError('');
+    try {
+      await api(`/api/models/${model.id}/folder`, { method: 'PUT', body: JSON.stringify({ folderId: moveFolderId }) });
+      await onChanged();
+    } catch (reason) {
+      setActionError((reason as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div
       className={`drawer-backdrop ${editing ? 'editor-backdrop' : ''}`}
@@ -3544,25 +4075,30 @@ function ModelDrawer({
                   {currentModelStatus === 'draft' ? 'Edit draft' : 'Create revision'}
                 </button>
               )}
-              {role === 'admin' && (
-                <>
-                  {activeRevision && (
-                    <button className="secondary model-action" disabled={busy} onClick={deactivateFamily}>
-                      <FileClock />
-                      Deactivate model
-                    </button>
-                  )}
-                  {!activeRevision && currentModel.status === 'approved' && (
-                    <button className="secondary model-action" disabled={busy} onClick={reactivateFamily}>
-                      <ShieldCheck />
-                      Reactivate model
-                    </button>
-                  )}
-                  <button className="danger model-action" disabled={busy} onClick={deleteFamily}>
-                    <Trash2 />
-                    Delete model
+              {canMoveModel && (
+                <div className="model-manage" ref={manageMenuRef}>
+                  <button type="button" className="secondary model-action" aria-expanded={showManageMenu} aria-controls="model-manage-menu" onClick={() => setShowManageMenu((open) => !open)}>
+                    <Settings2 /> Manage model <ChevronDown />
                   </button>
-                </>
+                  {showManageMenu && (
+                    <div className="model-manage-menu" id="model-manage-menu">
+                      {canMoveModel && <div className="model-manage-folder">
+                        <label htmlFor="model-manage-folder-select">Move to folder</label>
+                        <select id="model-manage-folder-select" value={moveFolderId} onChange={(event) => setMoveFolderId(event.target.value)}>
+                          <option value="">Unfiled</option>
+                          {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                        </select>
+                        <button type="button" className="secondary" disabled={busy || moveFolderId === (currentModel.folderId || '')} onClick={() => { setShowManageMenu(false); void moveToFolder(); }}>Move model</button>
+                      </div>}
+                      {role === 'admin' && <>
+                        {manageableDraft && <button type="button" disabled={busy} onClick={() => { setShowManageMenu(false); void transferDraft(manageableDraft.id); }}><Users /> Transfer draft owner</button>}
+                        {activeRevision && <button type="button" disabled={busy} onClick={() => { setShowManageMenu(false); void deactivateFamily(); }}><FileClock /> Deactivate model</button>}
+                        {!activeRevision && currentModel.status === 'approved' && <button type="button" disabled={busy} onClick={() => { setShowManageMenu(false); void reactivateFamily(); }}><ShieldCheck /> Reactivate model</button>}
+                        <button type="button" className="danger" disabled={busy} onClick={() => { setShowManageMenu(false); void deleteFamily(); }}><Trash2 /> Delete model</button>
+                      </>}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             <div className="model-detail-tools">
@@ -3666,8 +4202,18 @@ function ModelDrawer({
                         Rejected by {item.rejectedBy}: {item.rejectionReason}
                       </p>
                     )}
-                    {item.status === 'draft' && (
-                      <div className="revision-actions">
+                    <div className="revision-actions">
+                      <button
+                        type="button"
+                        className="secondary model-action"
+                        title={`Download revision ${item.revision} as JSON`}
+                        onClick={() => downloadRevisionJSON(item)}
+                      >
+                        <Download />
+                        Download JSON
+                      </button>
+                      {item.status === 'draft' && (
+                        <>
                         {canDevelop && (
                           <button
                             className="secondary model-action"
@@ -3680,16 +4226,6 @@ function ModelDrawer({
                           >
                             <Settings2 />
                             Edit draft
-                          </button>
-                        )}
-                        {role === 'admin' && (
-                          <button
-                            className="secondary model-action"
-                            disabled={busy}
-                            onClick={() => transferDraft(item.id)}
-                          >
-                            <Users />
-                            Transfer owner
                           </button>
                         )}
                         {canDevelop && (
@@ -3722,10 +4258,18 @@ function ModelDrawer({
                             Delete draft
                           </button>
                         )}
-                      </div>
-                    )}
-                    {item.status === 'pending_approval' && canApprove && (
-                      <div className="revision-actions">
+                        </>
+                      )}
+                      {item.status === 'pending_approval' && canApprove && (
+                        <>
+                        <button
+                          className="secondary model-action"
+                          disabled={busy || reviewLoadingId === item.id}
+                          onClick={() => void openRevisionReview(item)}
+                        >
+                          <GitBranch />
+                          {reviewLoadingId === item.id ? 'Loading…' : 'Review changes'}
+                        </button>
                         <button
                           className="secondary model-action"
                           disabled={busy}
@@ -3750,10 +4294,9 @@ function ModelDrawer({
                           <X />
                           Reject revision
                         </button>
-                      </div>
-                    )}
-                    {item.status === 'superseded' && canDevelop && (
-                      <div className="revision-actions">
+                        </>
+                      )}
+                      {item.status === 'superseded' && canDevelop && (
                         <button
                           className="secondary model-action"
                           disabled={busy}
@@ -3766,14 +4309,21 @@ function ModelDrawer({
                           <GitBranch />
                           Create from this
                         </button>
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}
             </div>
           </>
         ) : (
+          <>
+          {isNew && <div className="model-create-folder"><label>Folder
+            <select value={folderId} onChange={(event) => setFolderId(event.target.value)}>
+              <option value="">Unfiled</option>
+              {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+            </select>
+          </label></div>}
           <ModelEditor
             isNew={isNew}
             editingDraft={editTarget.status === 'draft'}
@@ -3786,6 +4336,7 @@ function ModelDrawer({
             create={create}
             back={() => setEditing(false)}
           />
+          </>
         )}
       </aside>
       {simulationDraft && (
@@ -3811,6 +4362,7 @@ function ModelDrawer({
           </section>
         </div>
       )}
+      {revisionReview && <RevisionReviewDialog current={revisionReview.current} previous={revisionReview.previous} onClose={() => setRevisionReview(undefined)} />}
       {showDependencies && (
         <DependencyDialog
           parameters={model.parameters}

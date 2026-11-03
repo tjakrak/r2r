@@ -18,6 +18,7 @@ const productionSchema = "PCS"
 func emptySQLConfig() Config {
 	return Config{
 		Sources:          []Source{},
+		Folders:          []ModelFolder{},
 		InputDefinitions: []InputDefinition{},
 		Users:            []UserRegistration{},
 		Models:           []control.Model{},
@@ -146,6 +147,9 @@ func (s *Store) loadSQL(ctx context.Context) error {
 	if err := s.loadSources(ctx); err != nil {
 		return err
 	}
+	if err := s.loadFolders(ctx); err != nil {
+		return err
+	}
 	if err := s.loadModels(ctx); err != nil {
 		return err
 	}
@@ -156,6 +160,24 @@ func (s *Store) loadSQL(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) loadFolders(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT FOLDER_ID, NAME, COALESCE(DESCRIPTION,N''), CREATED_BY, CREATED_AT_UTC, UPDATED_BY, UPDATED_AT_UTC FROM PCS.MODEL_FOLDERS ORDER BY NAME`)
+	if err != nil {
+		return fmt.Errorf("load PCS.MODEL_FOLDERS (apply SQL/19_model_folders.sql): %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folder ModelFolder
+		var created, updated time.Time
+		if err := rows.Scan(&folder.ID, &folder.Name, &folder.Description, &folder.CreatedBy, &created, &folder.UpdatedBy, &updated); err != nil {
+			return err
+		}
+		folder.CreatedAt, folder.UpdatedAt = created.UTC().Format(time.RFC3339Nano), updated.UTC().Format(time.RFC3339Nano)
+		s.config.Folders = append(s.config.Folders, folder)
+	}
+	return rows.Err()
 }
 
 func (s *Store) loadInputDefinitions(ctx context.Context) error {
@@ -217,17 +239,17 @@ func (s *Store) loadSources(ctx context.Context) error {
 }
 
 func (s *Store) loadModels(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT MODEL_ID, FAMILY_ID, REVISION, STATUS, ENABLED, DEFINITION_JSON,
-		CHANGE_NOTE, OWNER_NAME, CREATED_BY, CREATED_AT_UTC, SUBMITTED_BY, SUBMITTED_AT_UTC,
-		APPROVED_BY, APPROVED_AT_UTC, REJECTED_BY, REJECTED_AT_UTC, REJECTION_REASON
-		FROM PCS.MODEL_REVISIONS ORDER BY FAMILY_ID, REVISION`)
+	rows, err := s.db.QueryContext(ctx, `SELECT R.MODEL_ID, R.FAMILY_ID, R.REVISION, R.STATUS, R.ENABLED, R.DEFINITION_JSON,
+		R.CHANGE_NOTE, R.OWNER_NAME, R.CREATED_BY, R.CREATED_AT_UTC, R.SUBMITTED_BY, R.SUBMITTED_AT_UTC,
+		R.APPROVED_BY, R.APPROVED_AT_UTC, R.REJECTED_BY, R.REJECTED_AT_UTC, R.REJECTION_REASON, COALESCE(F.FOLDER_ID,N'')
+		FROM PCS.MODEL_REVISIONS R JOIN PCS.MODEL_FAMILIES F ON F.FAMILY_ID=R.FAMILY_ID ORDER BY R.FAMILY_ID, R.REVISION`)
 	if err != nil {
 		return fmt.Errorf("load PCS.MODEL_REVISIONS: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var m control.Model
-		var modelID, familyID, status, changeNote, owner, createdBy string
+		var modelID, familyID, status, changeNote, owner, createdBy, folderID string
 		var revision int
 		var enabled bool
 		var definition []byte
@@ -236,7 +258,7 @@ func (s *Store) loadModels(ctx context.Context) error {
 		var submittedAt, approvedAt, rejectedAt sql.NullTime
 		if err := rows.Scan(&modelID, &familyID, &revision, &status, &enabled, &definition, &changeNote,
 			&owner, &createdBy, &created, &submittedBy, &submittedAt, &approvedBy, &approvedAt,
-			&rejectedBy, &rejectedAt, &rejection); err != nil {
+			&rejectedBy, &rejectedAt, &rejection, &folderID); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(definition, &m); err != nil {
@@ -244,6 +266,7 @@ func (s *Store) loadModels(ctx context.Context) error {
 		}
 		// Relational workflow columns are authoritative over the JSON snapshot.
 		m.ID, m.FamilyID, m.Revision, m.Status, m.Enabled = modelID, familyID, revision, status, enabled
+		m.FolderID = folderID
 		m.ChangeNote, m.Owner, m.CreatedBy = changeNote, owner, createdBy
 		m.CreatedAt = created.UTC().Format(time.RFC3339Nano)
 		m.SubmittedBy, m.ApprovedBy, m.RejectedBy, m.RejectionReason = submittedBy.String, approvedBy.String, rejectedBy.String, rejection.String
@@ -441,6 +464,54 @@ func (s *Store) persistModels(models ...control.Model) error {
 		return nil
 	})
 }
+
+func (s *Store) saveFolderSQL(folder ModelFolder) error {
+	if s.db == nil {
+		return nil
+	}
+	return s.sqlTransaction(func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `IF EXISTS(SELECT 1 FROM PCS.MODEL_FOLDERS WHERE FOLDER_ID=@p1)
+			UPDATE PCS.MODEL_FOLDERS SET NAME=@p2,DESCRIPTION=NULLIF(@p3,N''),UPDATED_BY=@p4,UPDATED_AT_UTC=SYSUTCDATETIME() WHERE FOLDER_ID=@p1
+			ELSE INSERT PCS.MODEL_FOLDERS(FOLDER_ID,NAME,DESCRIPTION,CREATED_BY,UPDATED_BY) VALUES(@p1,@p2,NULLIF(@p3,N''),@p4,@p4)`, folder.ID, folder.Name, folder.Description, folder.UpdatedBy)
+		return err
+	})
+}
+
+func (s *Store) deleteFolderSQL(id string) error {
+	if s.db == nil {
+		return nil
+	}
+	result, err := s.db.Exec(`DELETE PCS.MODEL_FOLDERS WHERE FOLDER_ID=@p1 AND NOT EXISTS(SELECT 1 FROM PCS.MODEL_FAMILIES WHERE FOLDER_ID=@p1)`, id)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("folder not found or still contains models")
+	}
+	return nil
+}
+
+func (s *Store) moveModelFamilySQL(familyID, folderID string) error {
+	if s.db == nil {
+		return nil
+	}
+	result, err := s.db.Exec(`UPDATE PCS.MODEL_FAMILIES SET FOLDER_ID=NULLIF(@p2,N'') WHERE FAMILY_ID=@p1`, familyID, folderID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("model family not found")
+	}
+	return nil
+}
 func (s *Store) persistRun(r RunRecord) error {
 	if s.db == nil {
 		return s.persist()
@@ -565,7 +636,7 @@ func saveModelSQL(ctx context.Context, tx *sql.Tx, m control.Model) error {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `IF NOT EXISTS (SELECT 1 FROM PCS.MODEL_FAMILIES WHERE FAMILY_ID=@p1)
-		INSERT PCS.MODEL_FAMILIES (FAMILY_ID,NAME,DESCRIPTION,CREATED_BY) VALUES (@p1,@p2,NULLIF(@p3,N''),@p4)`, m.FamilyID, m.Name, m.Description, m.CreatedBy)
+		INSERT PCS.MODEL_FAMILIES (FAMILY_ID,NAME,DESCRIPTION,CREATED_BY,FOLDER_ID) VALUES (@p1,@p2,NULLIF(@p3,N''),@p4,NULLIF(@p5,N''))`, m.FamilyID, m.Name, m.Description, m.CreatedBy, m.FolderID)
 	if err != nil {
 		return err
 	}

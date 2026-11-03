@@ -43,6 +43,20 @@ func TestBindSQLParametersUsesPreviouslyResolvedValues(t *testing.T) {
 	}
 }
 
+func TestApplicationRelativePathRemovesConfiguredBasePath(t *testing.T) {
+	tests := map[string]string{
+		"/R2RProcessControl/api/runs/recent": "/api/runs/recent",
+		"/R2RProcessControl":                 "/",
+		"/api/runs/recent":                   "/api/runs/recent",
+		"/another/api/path":                  "/another/api/path",
+	}
+	for input, expected := range tests {
+		if actual := applicationRelativePath(input); actual != expected {
+			t.Fatalf("applicationRelativePath(%q) = %q; want %q", input, actual, expected)
+		}
+	}
+}
+
 func TestBindSQLParametersRejectsLaterOrUnknownValues(t *testing.T) {
 	_, err := bindSQLParameters("SELECT value WHERE wafer_id = @wafer_id", map[string]interface{}{})
 	if err == nil || !strings.Contains(err.Error(), "has not been declared earlier") {
@@ -147,6 +161,48 @@ func TestPrepareRejectsLegacyCombinedContext(t *testing.T) {
 	s.prepare(recorder, request)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "unknown field") {
 		t.Fatalf("expected legacy context to be rejected, got %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPrepareReturnsNormalNoMatchOutcomeWithoutCreatingRun(t *testing.T) {
+	data, err := json.Marshal(store.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: st}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(
+		`{"indexes":{"machine":"M1","action":"PROCESS","material":"PRODUCT_A"},"externalInputs":{}}`,
+	))
+	recorder := httptest.NewRecorder()
+	s.prepare(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "no_match" || response["disposition"] != "no_control_recommendation" {
+		t.Fatalf("unexpected no-match response: %#v", response)
+	}
+	outputs, ok := response["outputs"].([]interface{})
+	if !ok || len(outputs) != 0 {
+		t.Fatalf("expected an empty outputs array: %#v", response["outputs"])
+	}
+	if _, exists := response["runId"]; exists {
+		t.Fatalf("no-match response must not contain a runId: %#v", response)
+	}
+	if runs := st.RecentRuns(10); len(runs) != 0 {
+		t.Fatalf("no-match response created a run: %+v", runs)
 	}
 }
 
@@ -532,6 +588,96 @@ func TestPrepareRecordsOutOfLimitRunFailure(t *testing.T) {
 	}
 	if !strings.Contains(runs[0].FailureMessage, `parameter "result" value 2 is below LSL 3`) {
 		t.Fatalf("rejected run failure message was not persisted: %+v", runs[0])
+	}
+}
+
+func TestProductionSimulationUsesPrepareContractWithoutPersistingRun(t *testing.T) {
+	model := control.Model{
+		ID: "simulation-r1", FamilyID: "simulation", Name: "Simulation", Revision: 1,
+		Status: "approved", Enabled: true,
+		Indexes: map[string]control.IndexValues{
+			"machine": {"M1"}, "action": {"TEST"}, "material": {"OXIDE"},
+		},
+		Parameters: []control.ParameterDefinition{{
+			Key: "result", Source: "expression", Definition: "1 + 1", DataType: "number",
+		}},
+		Outputs: []string{"result"},
+	}
+	data, _ := json.Marshal(store.Config{Models: []control.Model{model}})
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: st}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/simulate", strings.NewReader(
+		`{"indexes":{"machine":"M1","action":"TEST","material":"OXIDE"},"externalInputs":{}}`,
+	))
+	recorder := httptest.NewRecorder()
+	s.simulateProductionRun(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("simulation failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "simulated" {
+		t.Fatalf("unexpected simulation response: %#v", response)
+	}
+	if _, exists := response["simulation"]; exists {
+		t.Fatalf("dry-run response must not include a redundant simulation flag: %#v", response)
+	}
+	if _, exists := response["committed"]; exists {
+		t.Fatalf("dry-run response must not include a redundant committed flag: %#v", response)
+	}
+	if _, exists := response["runId"]; exists {
+		t.Fatalf("dry-run response must not expose a runId: %#v", response)
+	}
+	if runs := st.RecentRuns(10); len(runs) != 0 {
+		t.Fatalf("production simulation persisted runs: %+v", runs)
+	}
+}
+
+func TestRejectedProductionSimulationDoesNotPersistFailure(t *testing.T) {
+	model := control.Model{
+		ID: "simulation-limit-r1", FamilyID: "simulation-limit", Name: "Simulation limit", Revision: 1,
+		Status: "approved", Enabled: true,
+		Indexes: map[string]control.IndexValues{
+			"machine": {"M1"}, "action": {"TEST"}, "material": {"OXIDE"},
+		},
+		Parameters: []control.ParameterDefinition{{
+			Key: "result", Source: "expression", Definition: "2", DataType: "number",
+			LSL: floatPointer(3), LimitAction: "reject",
+		}},
+		Outputs: []string{"result"},
+	}
+	data, _ := json.Marshal(store.Config{Models: []control.Model{model}})
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: st}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/simulate", strings.NewReader(
+		`{"indexes":{"machine":"M1","action":"TEST","material":"OXIDE"},"externalInputs":{}}`,
+	))
+	recorder := httptest.NewRecorder()
+	s.simulateProductionRun(recorder, request)
+	if recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(recorder.Body.String(), `"status":"rejected"`) {
+		t.Fatalf("unexpected rejection: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"simulation"`) || strings.Contains(recorder.Body.String(), `"committed"`) {
+		t.Fatalf("rejected dry run contains redundant flags: %s", recorder.Body.String())
+	}
+	if runs := st.RecentRuns(10); len(runs) != 0 {
+		t.Fatalf("rejected production simulation persisted a failure: %+v", runs)
 	}
 }
 

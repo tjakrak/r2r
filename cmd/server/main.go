@@ -160,10 +160,21 @@ func clientIP(remoteAddress string) string {
 	return remoteAddress
 }
 
+func applicationRelativePath(path string) string {
+	if applicationBasePath != "" && path == applicationBasePath {
+		return "/"
+	}
+	if applicationBasePath != "" && strings.HasPrefix(path, applicationBasePath+"/") {
+		return strings.TrimPrefix(path, applicationBasePath)
+	}
+	return path
+}
+
 func (s *server) operationalLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		requestID := newRequestID()
+		relativePath := applicationRelativePath(r.URL.Path)
 		w.Header().Set("X-Request-ID", requestID)
 		r.Header.Set("X-Request-ID", requestID)
 		capture := &responseCapture{ResponseWriter: w}
@@ -200,7 +211,7 @@ func (s *server) operationalLogging(next http.Handler) http.Handler {
 				"clientIp":   clientIP(r.RemoteAddr),
 			})
 			if actor != "" && r.Method != http.MethodGet && s.store != nil && s.store.IsSQL() {
-				action, entityType, entityID := auditRoute(r.Method, r.URL.Path)
+				action, entityType, entityID := auditRoute(r.Method, relativePath)
 				outcome := "success"
 				if capture.status == http.StatusForbidden || capture.status == http.StatusUnauthorized {
 					outcome = "denied"
@@ -212,7 +223,7 @@ func (s *server) operationalLogging(next http.Handler) http.Handler {
 				}
 			}
 		}()
-		if s.store != nil && s.store.IsSQL() && strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/health" {
+		if s.store != nil && s.store.IsSQL() && strings.HasPrefix(relativePath, "/api/") && relativePath != "/api/health" {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			err := s.store.Refresh(ctx)
 			cancel()
@@ -605,7 +616,11 @@ func (s *server) refactorParameter(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *server) prepare(w http.ResponseWriter, r *http.Request) {
-	s.executeRun(w, r, false)
+	s.executeRun(w, r, false, false)
+}
+
+func (s *server) simulateProductionRun(w http.ResponseWriter, r *http.Request) {
+	s.executeRun(w, r, false, true)
 }
 
 func validatePrepareIndexes(indexes map[string]interface{}, definitions []store.InputDefinition) (map[string]interface{}, error) {
@@ -656,7 +671,7 @@ func prepareExecutionContext(model control.Model, indexes, externalInputs map[st
 	return context, nil
 }
 
-func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdaptive bool) {
+func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdaptive, dryRun bool) {
 	if r.Method != "POST" {
 		write(w, 405, map[string]string{"error": "method not allowed"})
 		return
@@ -677,6 +692,14 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	}
 	model, reason, err := control.Select(s.store.Config().Models, indexes)
 	if err != nil {
+		if errors.Is(err, control.ErrNoMatchingModel) {
+			write(w, http.StatusOK, map[string]interface{}{
+				"status":      "no_match",
+				"disposition": "no_control_recommendation",
+				"outputs":     []control.OutputValue{},
+			})
+			return
+		}
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
@@ -687,12 +710,17 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	}
 	runID := newRunID()
 	requestID := r.Header.Get("X-Request-ID")
+	recordFailure := func(parameters map[string]interface{}, samples map[string][]map[string]interface{}, outputs []control.OutputValue, failureCode, failureMessage, disposition string) {
+		if !dryRun {
+			s.recordExecutionFailure(runID, requestID, model, context, parameters, samples, outputs, failureCode, failureMessage, disposition)
+		}
+	}
 	limitResults := map[string]control.OutputValue{}
 	collectLimit := func(result control.OutputValue) { limitResults[result.Parameter] = result }
 	values, samples, unresolvedSQL, err := control.ResolveModelWithLimitCollector(model, context, nil, nil, s.store.AdaptiveValues(model, context), s.sqlParameterResolver(r.Context()), s.sqlDataSampleResolver(r.Context()), collectLimit)
 	if err != nil {
-		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
-		if writeParameterLimitRejection(w, runID, model, err) {
+		recordFailure(values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
+		if writeParameterLimitRejection(w, runID, model, err, dryRun) {
 			return
 		}
 		write(w, 422, map[string]string{"error": err.Error()})
@@ -703,7 +731,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		for _, parameter := range unresolvedSQL {
 			missing = append(missing, map[string]string{"key": parameter.Key, "query": parameter.Definition})
 		}
-		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", "SQL resolver is not configured", "run_rejected")
+		recordFailure(values, samples, nil, "PARAMETER_EVALUATION_FAILED", "SQL resolver is not configured", "run_rejected")
 		write(w, 501, map[string]interface{}{"error": "SQL resolver is not configured", "unresolvedParameters": missing, "controlModel": map[string]interface{}{"id": model.ID, "revision": model.Revision}})
 		return
 	}
@@ -711,7 +739,7 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	if commitAdaptive || !s.store.HasUnfinishedRun(model, context) {
 		adaptiveUpdates, err = control.CalculateAdaptiveUpdatesForSource(model, values, "parameter")
 		if err != nil {
-			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", err.Error(), "run_rejected")
+			recordFailure(values, samples, nil, "PARAMETER_EVALUATION_FAILED", err.Error(), "run_rejected")
 			write(w, 422, map[string]string{"error": err.Error()})
 			return
 		}
@@ -725,22 +753,22 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 		collectLimit = func(result control.OutputValue) { limitResults[result.Parameter] = result }
 		values, samples, unresolvedSQL, err = control.ResolveModelWithLimitCollector(model, context, values, samples, nextAdaptive, nil, nil, collectLimit)
 		if err != nil {
-			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
-			if writeParameterLimitRejection(w, runID, model, err) {
+			recordFailure(values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
+			if writeParameterLimitRejection(w, runID, model, err, dryRun) {
 				return
 			}
 			write(w, 422, map[string]string{"error": err.Error()})
 			return
 		}
 		if len(unresolvedSQL) > 0 {
-			s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, "PARAMETER_EVALUATION_FAILED", "failed to reevaluate parameters after adaptive update", "run_rejected")
+			recordFailure(values, samples, nil, "PARAMETER_EVALUATION_FAILED", "failed to reevaluate parameters after adaptive update", "run_rejected")
 			write(w, 500, map[string]string{"error": "failed to reevaluate parameters after adaptive update"})
 			return
 		}
 	}
 	outputs, err := control.EvaluateResolvedOutputs(model, values, limitResults)
 	if err != nil {
-		s.recordExecutionFailure(runID, requestID, model, context, values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
+		recordFailure(values, samples, nil, failureCodeForExecutionError(err), err.Error(), "run_rejected")
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
@@ -769,26 +797,50 @@ func (s *server) executeRun(w http.ResponseWriter, r *http.Request, commitAdapti
 	}
 	if len(rejected) > 0 {
 		failureMessage := "Run is not allowed: " + strings.Join(rejectionReasons, "; ") + "."
-		s.recordExecutionFailure(runID, requestID, model, context, values, samples, outputs, "PARAMETER_LIMIT_REJECTED", failureMessage, "run_rejected")
-		write(w, 422, map[string]interface{}{
+		recordFailure(values, samples, outputs, "PARAMETER_LIMIT_REJECTED", failureMessage, "run_rejected")
+		response := map[string]interface{}{
 			"status":      "rejected",
 			"disposition": "run_rejected",
 			"error":       failureMessage,
-			"runId":       runID,
 			"controlModel": map[string]interface{}{
 				"id": model.ID, "familyId": model.FamilyID, "name": model.Name,
 				"revision": model.Revision,
 			},
 			"violations": rejected,
-		})
+		}
+		if !dryRun {
+			response["runId"] = runID
+		}
+		write(w, 422, response)
 		return
 	}
 	if commitAdaptive {
 		if err := s.store.CommitAdaptive(model, context, runID, adaptiveUpdates); err != nil {
-			s.recordExecutionFailure(runID, requestID, model, context, values, samples, outputs, "RUN_PERSISTENCE_FAILED", "failed to persist adaptive state", "run_rejected")
+			recordFailure(values, samples, outputs, "RUN_PERSISTENCE_FAILED", "failed to persist adaptive state", "run_rejected")
 			write(w, 500, map[string]string{"error": "failed to persist adaptive state"})
 			return
 		}
+	}
+	if dryRun {
+		if err := s.store.CheckPreparedRunLimit(model, context); err != nil {
+			write(w, 409, map[string]interface{}{
+				"status": "rejected", "disposition": "run_rejected", "error": err.Error(),
+				"controlModel": map[string]interface{}{
+					"id": model.ID, "familyId": model.FamilyID, "name": model.Name, "revision": model.Revision,
+				},
+			})
+			return
+		}
+		write(w, 200, map[string]interface{}{
+			"requestId": requestID, "status": "simulated",
+			"controlModel": map[string]interface{}{
+				"id": model.ID, "familyId": model.FamilyID, "name": model.Name, "revision": model.Revision, "owner": model.Owner,
+			},
+			"routing": map[string]string{"reason": reason}, "parameters": values,
+			"adaptiveUpdates": adaptiveUpdates, "dataSamples": samples, "outputs": outputs,
+			"disposition": disposition, "meta": map[string]string{"receivedAt": time.Now().UTC().Format(time.RFC3339)},
+		})
+		return
 	}
 	id := runID
 	status := "completed"
@@ -872,22 +924,25 @@ func truncateFailureMessage(message string) string {
 	return message
 }
 
-func writeParameterLimitRejection(w http.ResponseWriter, runID string, model control.Model, resolveErr error) bool {
+func writeParameterLimitRejection(w http.ResponseWriter, runID string, model control.Model, resolveErr error, dryRun bool) bool {
 	var limitErr *control.ParameterLimitError
 	if !errors.As(resolveErr, &limitErr) {
 		return false
 	}
-	write(w, http.StatusUnprocessableEntity, map[string]interface{}{
+	response := map[string]interface{}{
 		"status":      "rejected",
 		"disposition": "run_rejected",
 		"error":       "Run is not allowed: " + limitErr.Message + ".",
-		"runId":       runID,
 		"controlModel": map[string]interface{}{
 			"id": model.ID, "familyId": model.FamilyID, "name": model.Name,
 			"revision": model.Revision,
 		},
 		"violations": []control.OutputValue{limitErr.Violation},
-	})
+	}
+	if !dryRun {
+		response["runId"] = runID
+	}
+	write(w, http.StatusUnprocessableEntity, response)
 	return true
 }
 
@@ -1066,6 +1121,40 @@ func (s *server) revisions(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[2]
 	action := parts[3]
+	if action == "folder" && r.Method == http.MethodPut {
+		if !s.requireRole(w, r, "engineer", "engineering_manager", "admin") {
+			return
+		}
+		model, found := s.store.Model(id)
+		if !found {
+			write(w, 404, map[string]string{"error": "model revision not found"})
+			return
+		}
+		current, _ := s.currentUser(r)
+		if current.Role != "admin" && !strings.EqualFold(model.Owner, actorID(current)) {
+			write(w, 403, map[string]string{"error": "only the model owner or an administrator can move this model"})
+			return
+		}
+		var request struct {
+			FolderID *string `json:"folderId"`
+		}
+		if err := decode(r, &request); err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		if request.FolderID == nil {
+			write(w, 400, map[string]string{"error": "folderId is required; use an empty string for Unfiled"})
+			return
+		}
+		folderID := strings.TrimSpace(*request.FolderID)
+		if err := s.store.MoveModelFamily(model.FamilyID, folderID); err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		_ = s.store.RecordAudit(actorID(current), "model_family.moved", "success", "model_family", model.FamilyID, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), map[string]interface{}{"fromFolderId": model.FolderID, "toFolderId": folderID})
+		write(w, 200, map[string]string{"status": "moved", "familyId": model.FamilyID, "folderId": folderID})
+		return
+	}
 	if action == "deactivate" && r.Method == "POST" {
 		if !s.requireRole(w, r, "admin") {
 			return
@@ -1388,6 +1477,79 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	write(w, 201, created)
 }
 
+func (s *server) modelFolders(w http.ResponseWriter, r *http.Request) {
+	id := ""
+	if r.URL.Path != "/api/model-folders" {
+		id = strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/model-folders/"), "/")
+	}
+	if strings.Contains(id, "/") {
+		write(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	if r.Method == http.MethodGet && id == "" {
+		write(w, 200, s.store.Config().Folders)
+		return
+	}
+	if id == "" && r.Method == http.MethodPost {
+		if !s.requireRole(w, r, "engineer", "engineering_manager", "admin") {
+			return
+		}
+		var request struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		if err := decode(r, &request); err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		current, _ := s.currentUser(r)
+		folder, err := s.store.CreateFolder(request.Name, request.Description, actorID(current))
+		if err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		_ = s.store.RecordAudit(actorID(current), "model_folder.created", "success", "model_folder", folder.ID, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), map[string]interface{}{"name": folder.Name})
+		write(w, 201, folder)
+		return
+	}
+	if id != "" && r.Method == http.MethodPut {
+		if !s.requireRole(w, r, "engineer", "engineering_manager", "admin") {
+			return
+		}
+		var request struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		if err := decode(r, &request); err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		current, _ := s.currentUser(r)
+		folder, err := s.store.UpdateFolder(id, request.Name, request.Description, actorID(current))
+		if err != nil {
+			write(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		_ = s.store.RecordAudit(actorID(current), "model_folder.updated", "success", "model_folder", folder.ID, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), map[string]interface{}{"name": folder.Name})
+		write(w, 200, folder)
+		return
+	}
+	if id != "" && r.Method == http.MethodDelete {
+		if !s.requireRole(w, r, "admin") {
+			return
+		}
+		if err := s.store.DeleteFolder(id); err != nil {
+			write(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		current, _ := s.currentUser(r)
+		_ = s.store.RecordAudit(actorID(current), "model_folder.deleted", "success", "model_folder", id, r.Header.Get("X-Request-ID"), clientIP(r.RemoteAddr), nil)
+		write(w, 200, map[string]string{"status": "deleted"})
+		return
+	}
+	write(w, 405, map[string]string{"error": "method not allowed"})
+}
+
 func (s *server) importModel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		write(w, 405, map[string]string{"error": "method not allowed"})
@@ -1404,6 +1566,7 @@ func (s *server) importModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Identity and workflow state always come from R2R, never from imported JSON.
+	model.FolderID = strings.TrimSpace(r.URL.Query().Get("folderId"))
 	model.ID = ""
 	model.FamilyID = ""
 	model.Revision = 0
@@ -2553,10 +2716,13 @@ func main() {
 	mux.HandleFunc("/api/expressions/explain", s.authenticated(s.explainExpression))
 	mux.HandleFunc("/api/parameters/refactor", s.authenticated(s.refactorParameter))
 	mux.HandleFunc("/api/v1/runs/prepare", s.prepare)
+	mux.HandleFunc("/api/v1/runs/simulate", s.simulateProductionRun)
 	mux.HandleFunc("/api/v1/runs/", s.complete)
 	mux.HandleFunc("/api/runs/recent", s.authenticated(s.recentRuns))
 	mux.HandleFunc("/api/models", s.authenticated(s.models))
 	mux.HandleFunc("/api/models/import", s.authenticated(s.importModel))
+	mux.HandleFunc("/api/model-folders/", s.authenticated(s.modelFolders))
+	mux.HandleFunc("/api/model-folders", s.authenticated(s.modelFolders))
 	mux.HandleFunc("/api/models/", s.authenticated(s.revisions))
 	mux.HandleFunc("/api/sources/", s.authenticated(s.sources))
 	mux.HandleFunc("/api/input-definitions/", s.authenticated(s.inputDefinitions))

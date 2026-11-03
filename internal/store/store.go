@@ -1,7 +1,9 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,12 +53,137 @@ type UserRegistration struct {
 }
 type Config struct {
 	Sources          []Source                 `json:"sources"`
+	Folders          []ModelFolder            `json:"folders"`
 	InputDefinitions []InputDefinition        `json:"inputDefinitions"`
 	Users            []UserRegistration       `json:"users,omitempty"`
 	Models           []control.Model          `json:"models"`
 	AdaptiveStates   map[string]AdaptiveState `json:"adaptiveStates,omitempty"`
 	Runs             []RunRecord              `json:"runs,omitempty"`
 	NextRunSequence  int64                    `json:"nextRunSequence,omitempty"`
+}
+
+type ModelFolder struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	CreatedBy   string `json:"createdBy"`
+	CreatedAt   string `json:"createdAt"`
+	UpdatedBy   string `json:"updatedBy"`
+	UpdatedAt   string `json:"updatedAt"`
+}
+
+func (s *Store) folderExists(id string) bool {
+	if id == "" {
+		return true
+	}
+	for _, folder := range s.config.Folders {
+		if folder.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) CreateFolder(name, description, actor string) (ModelFolder, error) {
+	name, description = strings.TrimSpace(name), strings.TrimSpace(description)
+	if name == "" || len([]rune(name)) > 200 || len([]rune(description)) > 1000 {
+		return ModelFolder{}, errors.New("folder name is required (maximum 200 characters); description may be up to 1000 characters")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, folder := range s.config.Folders {
+		if strings.EqualFold(folder.Name, name) {
+			return ModelFolder{}, errors.New("a folder with this name already exists")
+		}
+	}
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return ModelFolder{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	folder := ModelFolder{ID: "folder-" + hex.EncodeToString(bytes), Name: name, Description: description, CreatedBy: actor, CreatedAt: now, UpdatedBy: actor, UpdatedAt: now}
+	if err := s.saveFolderSQL(folder); err != nil {
+		return ModelFolder{}, err
+	}
+	s.config.Folders = append(s.config.Folders, folder)
+	if err := s.persist(); err != nil {
+		return ModelFolder{}, err
+	}
+	return folder, nil
+}
+
+func (s *Store) UpdateFolder(id, name, description, actor string) (ModelFolder, error) {
+	name, description = strings.TrimSpace(name), strings.TrimSpace(description)
+	if name == "" || len([]rune(name)) > 200 || len([]rune(description)) > 1000 {
+		return ModelFolder{}, errors.New("folder name is required (maximum 200 characters); description may be up to 1000 characters")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, folder := range s.config.Folders {
+		if folder.ID != id && strings.EqualFold(folder.Name, name) {
+			return ModelFolder{}, errors.New("a folder with this name already exists")
+		}
+	}
+	for index, folder := range s.config.Folders {
+		if folder.ID != id {
+			continue
+		}
+		folder.Name, folder.Description, folder.UpdatedBy, folder.UpdatedAt = name, description, actor, time.Now().UTC().Format(time.RFC3339Nano)
+		if err := s.saveFolderSQL(folder); err != nil {
+			return ModelFolder{}, err
+		}
+		s.config.Folders[index] = folder
+		return folder, s.persist()
+	}
+	return ModelFolder{}, errors.New("folder not found")
+}
+
+func (s *Store) DeleteFolder(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, model := range s.config.Models {
+		if model.FolderID == id {
+			return errors.New("move all models out of this folder before deleting it")
+		}
+	}
+	for index, folder := range s.config.Folders {
+		if folder.ID != id {
+			continue
+		}
+		if err := s.deleteFolderSQL(id); err != nil {
+			return err
+		}
+		s.config.Folders = append(s.config.Folders[:index], s.config.Folders[index+1:]...)
+		return s.persist()
+	}
+	return errors.New("folder not found")
+}
+
+func (s *Store) MoveModelFamily(familyID, folderID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.folderExists(folderID) {
+		return errors.New("destination folder not found")
+	}
+	found := false
+	for _, model := range s.config.Models {
+		if model.FamilyID == familyID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return errors.New("model family not found")
+	}
+	if err := s.moveModelFamilySQL(familyID, folderID); err != nil {
+		return err
+	}
+	for index := range s.config.Models {
+		if s.config.Models[index].FamilyID == familyID {
+			s.config.Models[index].FolderID = folderID
+		}
+	}
+	return s.persist()
 }
 
 type ModelPurgeSummary struct {
@@ -439,6 +566,26 @@ func (s *Store) HasUnfinishedRun(model control.Model, context map[string]interfa
 	}
 	return false
 }
+func (s *Store) CheckPreparedRunLimit(model control.Model, context map[string]interface{}) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	limit := model.ExecutionPolicy.MaxUnfinishedRuns
+	if limit <= 0 {
+		return nil
+	}
+	partition := executionPartitionKey(model, context)
+	unfinished := 0
+	for _, existing := range s.config.Runs {
+		if existing.FamilyID == model.FamilyID && existing.Status == "prepared" &&
+			partition == executionPartitionKey(model, existing.Context) {
+			unfinished++
+		}
+	}
+	if unfinished >= limit {
+		return fmt.Errorf("maximum unfinished runs reached for this partition (%d)", limit)
+	}
+	return nil
+}
 func (s *Store) CompleteRun(id, status string, feedback map[string]interface{}, updates map[string]float64, failureCode, failureMessage string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -723,6 +870,9 @@ func (s *Store) RecordSourceTest(id, status, message string, elapsedMS int64) (S
 func (s *Store) CreateModel(model control.Model) (control.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.folderExists(model.FolderID) {
+		return control.Model{}, errors.New("destination folder not found")
+	}
 	if model.ChangeNote == "" || model.CreatedBy == "" {
 		return control.Model{}, errors.New("change note and author are required")
 	}
@@ -811,6 +961,7 @@ func (s *Store) CreateRevision(baseID string, next control.Model) (control.Model
 		}
 	}
 	next.FamilyID = base.FamilyID
+	next.FolderID = base.FolderID
 	next.Revision = maxRev + 1
 	next.ID = fmt.Sprintf("%s-r%d", base.FamilyID, next.Revision)
 	next.Status = "draft"
@@ -864,6 +1015,7 @@ func (s *Store) UpdateDraft(id string, next control.Model) (control.Model, error
 		}
 		next.ID = current.ID
 		next.FamilyID = current.FamilyID
+		next.FolderID = current.FolderID
 		next.Revision = current.Revision
 		next.Status = "draft"
 		next.Enabled = false

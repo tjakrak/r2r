@@ -268,6 +268,54 @@ func TestCreateModelStartsAsDraft(t *testing.T) {
 	}
 }
 
+func TestModelFolderPersistsAndFollowsRevisionFamily(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := s.CreateFolder("Etch", "Etch models", "manager")
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := control.Model{Name: "Folder example", FolderID: folder.ID, CreatedBy: "engineer", ChangeNote: "Initial", Indexes: map[string]control.IndexValues{"machine": {"M1"}, "action": {"ETCH"}, "material": {"OXIDE"}}, Parameters: []control.ParameterDefinition{{Key: "recipe", Source: "constant", Definition: "2"}}, Outputs: []string{"recipe"}}
+	created, err := s.CreateModel(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.FolderID != folder.ID {
+		t.Fatalf("folder not assigned: %+v", created)
+	}
+	if err := s.DeleteFolder(folder.ID); err == nil {
+		t.Fatal("expected nonempty folder deletion to fail")
+	}
+	revision, err := s.CreateRevision(created.ID, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.FolderID != folder.ID {
+		t.Fatal("revision did not inherit folder")
+	}
+	if err := s.MoveModelFamily(created.FamilyID, ""); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range reopened.Config().Models {
+		if item.FamilyID == created.FamilyID && item.FolderID != "" {
+			t.Fatalf("family revision retained old folder: %+v", item)
+		}
+	}
+	if err := reopened.DeleteFolder(folder.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeleteDraftRevisionAndFamily(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	base := control.Model{ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "approved", Enabled: true, Indexes: map[string]control.IndexValues{"machine": {"E1"}, "action": {"ETCH"}, "material": {"OXIDE"}}, Parameters: []control.ParameterDefinition{{Key: "recipe", Source: "constant", Definition: "2"}}, Outputs: []string{"recipe"}}

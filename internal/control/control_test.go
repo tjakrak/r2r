@@ -1,6 +1,7 @@
 package control
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -53,6 +54,14 @@ func TestSelectRejectsEquallySpecificOverlappingModels(t *testing.T) {
 	_, _, err := Select([]Model{first, second}, map[string]interface{}{"machine": "ETCH-02", "action": "OXIDE_ETCH", "material": "OXIDE", "chamber": "2"})
 	if err == nil || !strings.Contains(err.Error(), "ambiguous routing") {
 		t.Fatalf("expected ambiguity error, got %v", err)
+	}
+}
+func TestSelectReturnsTypedNoMatchError(t *testing.T) {
+	_, _, err := Select([]Model{fixture()}, map[string]interface{}{
+		"machine": "OTHER", "action": "OXIDE_ETCH", "material": "OXIDE",
+	})
+	if !errors.Is(err, ErrNoMatchingModel) {
+		t.Fatalf("expected ErrNoMatchingModel, got %v", err)
 	}
 }
 func TestSelectIndexWildcardAcceptsAnyNonEmptyValueAndLosesToExactMatch(t *testing.T) {

@@ -101,6 +101,7 @@ type ExecutionPolicy struct {
 type Model struct {
 	ID              string                    `json:"id"`
 	FamilyID        string                    `json:"familyId"`
+	FolderID        string                    `json:"folderId,omitempty"`
 	Name            string                    `json:"name"`
 	Owner           string                    `json:"owner"`
 	Revision        int                       `json:"revision"`
@@ -181,6 +182,8 @@ func (err *ParameterLimitError) Error() string { return err.Message }
 
 var requiredIndexes = []string{"machine", "action", "material"}
 
+var ErrNoMatchingModel = errors.New("no approved control model matches all supplied indexes")
+
 func stringValue(v interface{}) string {
 	if s, ok := v.(string); ok {
 		return s
@@ -253,7 +256,7 @@ func Select(models []Model, context map[string]interface{}) (Model, string, erro
 		}
 	}
 	if len(candidates) == 0 {
-		return Model{}, "", errors.New("no approved control model matches all supplied indexes")
+		return Model{}, "", ErrNoMatchingModel
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		leftKeys, leftValues := modelSpecificity(candidates[i])
