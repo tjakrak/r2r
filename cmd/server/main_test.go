@@ -206,6 +206,74 @@ func TestPrepareReturnsNormalNoMatchOutcomeWithoutCreatingRun(t *testing.T) {
 	}
 }
 
+func TestPrepareIgnoresUndeclaredExternalInputsAfterModelSelection(t *testing.T) {
+	model := control.Model{
+		ID: "ibe801-r1", FamilyID: "ibe801", Name: "IBE801", Revision: 1,
+		Status: "approved", Enabled: true,
+		Indexes: map[string]control.IndexValues{
+			"machine": {"IBE801"}, "action": {"CALCULATE"}, "material": {"PRODUCT_A"},
+		},
+		ExternalInputs: []control.ExternalInputDefinition{{Name: "target", Type: "number"}},
+		Parameters:     []control.ParameterDefinition{{Key: "result", Source: "expression", Definition: "@target + 1", DataType: "number"}},
+		Outputs:        []string{"result"},
+	}
+	data, err := json.Marshal(store.Config{Models: []control.Model{model}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{store: st}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(
+		`{"indexes":{"machine":"IBE801","action":"CALCULATE","material":"PRODUCT_A"},"externalInputs":{"target":2,"operation":"BS0P","lot_id":"L1"}}`,
+	))
+	recorder := httptest.NewRecorder()
+	s.prepare(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("prepare failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		RunID                 string                 `json:"runId"`
+		IgnoredExternalInputs []string               `json:"ignoredExternalInputs"`
+		Parameters            map[string]interface{} `json:"parameters"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.IgnoredExternalInputs) != 2 || response.IgnoredExternalInputs[0] != "lot_id" || response.IgnoredExternalInputs[1] != "operation" {
+		t.Fatalf("unexpected ignored inputs: %#v", response.IgnoredExternalInputs)
+	}
+	if response.Parameters["result"] != float64(3) || response.Parameters["operation"] != nil {
+		t.Fatalf("extra input affected evaluation: %#v", response.Parameters)
+	}
+	run, ok := st.Run(response.RunID)
+	if !ok || run.Context["operation"] != nil || run.Context["lot_id"] != nil {
+		t.Fatalf("extra inputs were persisted in run context: %+v", run)
+	}
+
+	missing := httptest.NewRecorder()
+	s.prepare(missing, httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(
+		`{"indexes":{"machine":"IBE801","action":"CALCULATE","material":"PRODUCT_A"},"externalInputs":{"operation":"BS0P"}}`,
+	)))
+	if missing.Code != http.StatusUnprocessableEntity || !strings.Contains(missing.Body.String(), "missing required external input") {
+		t.Fatalf("missing declared input was not rejected: %d %s", missing.Code, missing.Body.String())
+	}
+
+	wrongType := httptest.NewRecorder()
+	s.prepare(wrongType, httptest.NewRequest(http.MethodPost, "/api/v1/runs/prepare", strings.NewReader(
+		`{"indexes":{"machine":"IBE801","action":"CALCULATE","material":"PRODUCT_A"},"externalInputs":{"target":{},"operation":"BS0P"}}`,
+	)))
+	if wrongType.Code != http.StatusUnprocessableEntity || !strings.Contains(wrongType.Body.String(), "must be a number") {
+		t.Fatalf("wrongly typed declared input was not rejected: %d %s", wrongType.Code, wrongType.Body.String())
+	}
+}
+
 func TestReadOnlySQLAcceptsOneSelectAndRejectsAdditionalStatements(t *testing.T) {
 	query, err := readOnlySQL("  SELECT value FROM measurements; ")
 	if err != nil || query != "SELECT value FROM measurements" {

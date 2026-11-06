@@ -288,61 +288,66 @@ func evalNode(node ast.Expr, vars map[string]float64, samples map[string][]map[s
 			}
 			args = append(args, value)
 		}
-		switch name {
-		case "min":
-			if len(args) != 2 {
-				return 0, fmt.Errorf("min requires two arguments")
-			}
-			return math.Min(args[0], args[1]), nil
-		case "max":
-			if len(args) != 2 {
-				return 0, fmt.Errorf("max requires two arguments")
-			}
-			return math.Max(args[0], args[1]), nil
-		case "abs":
-			if len(args) != 1 {
-				return 0, fmt.Errorf("abs requires one argument")
-			}
-			return math.Abs(args[0]), nil
-		case "round":
-			if len(args) != 1 && len(args) != 2 {
-				return 0, fmt.Errorf("round requires a value and an optional number of decimal places")
-			}
-			if len(args) == 1 {
-				return math.Round(args[0]), nil
-			}
-			return roundToDecimalPlaces(args[0], args[1])
-		case "ceil", "cos", "exp", "floor", "log", "sin", "sqrt", "tan":
-			if len(args) != 1 {
-				return 0, fmt.Errorf("%s requires one argument", name)
-			}
-			switch name {
-			case "ceil":
-				return math.Ceil(args[0]), nil
-			case "cos":
-				return math.Cos(args[0]), nil
-			case "exp":
-				return math.Exp(args[0]), nil
-			case "floor":
-				return math.Floor(args[0]), nil
-			case "log":
-				return math.Log(args[0]), nil
-			case "sin":
-				return math.Sin(args[0]), nil
-			case "sqrt":
-				return math.Sqrt(args[0]), nil
-			default:
-				return math.Tan(args[0]), nil
-			}
-		case "pow":
-			if len(args) != 2 {
-				return 0, fmt.Errorf("pow requires two arguments")
-			}
-			return math.Pow(args[0], args[1]), nil
-		}
-		return 0, fmt.Errorf("function %q is not allowed", id.Name)
+		return evalNumericFunction(id.Name, args)
 	}
 	return 0, fmt.Errorf("expression element is not allowed")
+}
+
+func evalNumericFunction(function string, args []float64) (float64, error) {
+	name := strings.ToLower(function)
+	switch name {
+	case "min":
+		if len(args) != 2 {
+			return 0, fmt.Errorf("min requires two arguments")
+		}
+		return math.Min(args[0], args[1]), nil
+	case "max":
+		if len(args) != 2 {
+			return 0, fmt.Errorf("max requires two arguments")
+		}
+		return math.Max(args[0], args[1]), nil
+	case "abs":
+		if len(args) != 1 {
+			return 0, fmt.Errorf("abs requires one argument")
+		}
+		return math.Abs(args[0]), nil
+	case "round":
+		if len(args) != 1 && len(args) != 2 {
+			return 0, fmt.Errorf("round requires a value and an optional number of decimal places")
+		}
+		if len(args) == 1 {
+			return math.Round(args[0]), nil
+		}
+		return roundToDecimalPlaces(args[0], args[1])
+	case "ceil", "cos", "exp", "floor", "log", "sin", "sqrt", "tan":
+		if len(args) != 1 {
+			return 0, fmt.Errorf("%s requires one argument", name)
+		}
+		switch name {
+		case "ceil":
+			return math.Ceil(args[0]), nil
+		case "cos":
+			return math.Cos(args[0]), nil
+		case "exp":
+			return math.Exp(args[0]), nil
+		case "floor":
+			return math.Floor(args[0]), nil
+		case "log":
+			return math.Log(args[0]), nil
+		case "sin":
+			return math.Sin(args[0]), nil
+		case "sqrt":
+			return math.Sqrt(args[0]), nil
+		default:
+			return math.Tan(args[0]), nil
+		}
+	case "pow":
+		if len(args) != 2 {
+			return 0, fmt.Errorf("pow requires two arguments")
+		}
+		return math.Pow(args[0], args[1]), nil
+	}
+	return 0, fmt.Errorf("function %q is not allowed", function)
 }
 
 func roundToDecimalPlaces(value, places float64) (float64, error) {

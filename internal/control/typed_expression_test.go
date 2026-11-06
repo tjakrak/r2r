@@ -95,6 +95,26 @@ func TestTypedExpressionSupportsAggregateMathAndStringFunctions(t *testing.T) {
 	}
 }
 
+func TestTypedExpressionRoundsNestedLookupResult(t *testing.T) {
+	model := Model{DataSamples: []DataSampleDefinition{{
+		Key: "afm_data", Source: "static",
+		Columns: []DataSampleColumnDefinition{{Name: "wafer", Type: "string"}, {Name: "data", Type: "number"}},
+	}}}
+	rows := map[string][]map[string]interface{}{"afm_data": {{"wafer": "W1", "data": 2.345}}}
+	expression := `IF(IS_NULL(LOOKUP_ONE(@afm_data, @afm_data.wafer == @wafer_id, @afm_data.data)), 99.99, ROUND(LOOKUP_ONE(@afm_data, @afm_data.wafer == @wafer_id, @afm_data.data), 2))`
+	if err := ValidateTypedExpression(expression, "number", model, map[string]string{"wafer_id": "string"}); err != nil {
+		t.Fatalf("expression should validate: %v", err)
+	}
+	value, err := EvaluateTypedExpression(expression, "number", model, map[string]interface{}{"wafer_id": "W1"}, nil, rows)
+	if err != nil || value != 2.35 {
+		t.Fatalf("expected rounded lookup value 2.35, got %#v, %v", value, err)
+	}
+	value, err = EvaluateTypedExpression(expression, "number", model, map[string]interface{}{"wafer_id": "MISSING"}, nil, rows)
+	if err != nil || value != 99.99 {
+		t.Fatalf("expected missing lookup fallback 99.99, got %#v, %v", value, err)
+	}
+}
+
 func TestValidateModelAcceptsIfComparisonAgainstSQLParameter(t *testing.T) {
 	model := Model{
 		ID: "test-r1", FamilyID: "test", Name: "Test", Indexes: map[string]IndexValues{"machine": {"M1"}, "action": {"run"}, "material": {"Si"}},

@@ -163,7 +163,27 @@ func evalTypedNode(node ast.Expr, model Model, context, values map[string]interf
 		if name == "FIRST" || name == "NTH" || name == "LAST" {
 			return EvaluateSampleValue(text, samples)
 		}
-		return EvaluateWithSamples(text, numericValues(valuesAndContext(values, context)), samples)
+		if name == "AVG" || name == "MEDIAN" || name == "RANGE" || name == "STDEV" || name == "SUM" || name == "COUNT" ||
+			((name == "MIN" || name == "MAX") && len(n.Args) == 1 && isSelector(n.Args[0])) {
+			return EvaluateWithSamples(text, numericValues(valuesAndContext(values, context)), samples)
+		}
+		switch name {
+		case "ABS", "CEIL", "COS", "EXP", "FLOOR", "LOG", "ROUND", "SIN", "SQRT", "TAN", "POW", "MIN", "MAX":
+			args := make([]float64, 0, len(n.Args))
+			for _, argument := range n.Args {
+				value, err := evalTypedNode(argument, model, context, values, samples)
+				if err != nil {
+					return nil, err
+				}
+				number, err := numberValue(value)
+				if err != nil {
+					return nil, fmt.Errorf("%s requires numerical arguments", name)
+				}
+				args = append(args, number)
+			}
+			return evalNumericFunction(function.Name, args)
+		}
+		return nil, fmt.Errorf("function %q is not allowed", function.Name)
 	}
 	return nil, fmt.Errorf("unsupported expression")
 }

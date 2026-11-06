@@ -328,6 +328,62 @@ func TestSQLResolverReceivesPreviouslyDeclaredParameters(t *testing.T) {
 		t.Fatalf("unexpected SQL resolution: %+v %+v %v", values, unresolved, err)
 	}
 }
+
+func TestSQLQueriesCanReferenceDeclaredIndexes(t *testing.T) {
+	model := Model{
+		ID: "index-sql", FamilyID: "index-sql", Name: "Index SQL",
+		Indexes: map[string]IndexValues{
+			"machine": {"ETCH-02"}, "action": {"OXIDE_ETCH"}, "material": {"OXIDE"}, "chamber": {"B"},
+		},
+		Parameters: []ParameterDefinition{
+			{Key: "measured", Source: "sql", DataSourceID: "metrology", DataType: "number", Definition: "SELECT value FROM readings WHERE machine = @machine AND chamber = @chamber"},
+		},
+		DataSamples: []DataSampleDefinition{
+			{Key: "history", Source: "sql", DataSourceID: "metrology", Query: "SELECT value FROM history WHERE action = @action AND material = @material", Limit: 10},
+		},
+		Outputs: []string{"measured"},
+	}
+	if err := ValidateModel(model); err != nil {
+		t.Fatalf("index references should be valid SQL dependencies: %v", err)
+	}
+	graph, err := BuildDependencyGraph(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges := map[string]bool{}
+	for _, edge := range graph.Edges {
+		edges[edge.From+"->"+edge.To] = true
+	}
+	for _, edge := range []string{
+		"index:machine->parameter:measured", "index:chamber->parameter:measured",
+		"index:action->sample:history", "index:material->sample:history",
+	} {
+		if !edges[edge] {
+			t.Fatalf("missing SQL index dependency %s: %+v", edge, graph.Edges)
+		}
+	}
+	context := map[string]interface{}{"machine": "ETCH-02", "action": "OXIDE_ETCH", "material": "OXIDE", "chamber": "B", "unused": "not declared"}
+	values, samples, unresolved, err := ResolveModel(model, context, nil, nil, nil,
+		func(parameter ParameterDefinition, resolved map[string]interface{}) (interface{}, error) {
+			if resolved["machine"] != "ETCH-02" || resolved["chamber"] != "B" || resolved["unused"] != nil {
+				t.Fatalf("SQL parameter resolver received wrong index values: %+v", resolved)
+			}
+			return 2.0, nil
+		},
+		func(sample DataSampleDefinition, resolved map[string]interface{}) ([]map[string]interface{}, error) {
+			if resolved["action"] != "OXIDE_ETCH" || resolved["material"] != "OXIDE" || resolved["unused"] != nil {
+				t.Fatalf("SQL sample resolver received wrong index values: %+v", resolved)
+			}
+			return []map[string]interface{}{{"value": 1.0}}, nil
+		},
+	)
+	if err != nil || len(unresolved) != 0 || values["measured"] != 2.0 || len(samples["history"]) != 1 {
+		t.Fatalf("unexpected SQL resolution: values=%+v samples=%+v unresolved=%+v err=%v", values, samples, unresolved, err)
+	}
+	if _, exists := values["machine"]; exists {
+		t.Fatalf("index must not become a calculated parameter: %+v", values)
+	}
+}
 func TestFormulaCanReferenceLaterParameterThroughDependencyOrder(t *testing.T) {
 	model := fixture()
 	model.Parameters = []ParameterDefinition{{Key: "first", Source: "formula", Definition: "second + 1"}, {Key: "second", Source: "constant", Definition: "2"}}

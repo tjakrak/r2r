@@ -342,6 +342,19 @@ func ResolveModel(model Model, context, supplied map[string]interface{}, supplie
 	return ResolveModelWithLimitCollector(model, context, supplied, suppliedSamples, adaptiveValues, sqlResolver, sampleResolver, nil)
 }
 
+func sqlResolvedValues(model Model, context, values map[string]interface{}) map[string]interface{} {
+	resolved := make(map[string]interface{}, len(values)+len(model.Indexes))
+	for name, value := range values {
+		resolved[name] = value
+	}
+	for name := range model.Indexes {
+		if value, exists := context[name]; exists {
+			resolved[name] = value
+		}
+	}
+	return resolved
+}
+
 func ResolveModelWithLimitCollector(model Model, context, supplied map[string]interface{}, suppliedSamples map[string][]map[string]interface{}, adaptiveValues map[string]float64, sqlResolver SQLParameterResolver, sampleResolver DataSampleResolver, collectLimit func(OutputValue)) (map[string]interface{}, map[string][]map[string]interface{}, []ParameterDefinition, error) {
 	graph, err := BuildDependencyGraph(model)
 	if err != nil {
@@ -436,7 +449,7 @@ func ResolveModelWithLimitCollector(model Model, context, supplied map[string]in
 				samples[sample.Key] = rows
 				resolvedNodes[nodeID] = true
 			} else if sampleResolver != nil {
-				rows, resolveErr := sampleResolver(sample, values)
+				rows, resolveErr := sampleResolver(sample, sqlResolvedValues(model, context, values))
 				if resolveErr != nil {
 					return nil, nil, nil, resolveErr
 				}
@@ -470,7 +483,7 @@ func ResolveModelWithLimitCollector(model Model, context, supplied map[string]in
 				if exists {
 					value = raw
 				} else if sqlResolver != nil {
-					value, resolveErr = sqlResolver(parameter, values)
+					value, resolveErr = sqlResolver(parameter, sqlResolvedValues(model, context, values))
 				} else {
 					unresolved = append(unresolved, parameter)
 					continue

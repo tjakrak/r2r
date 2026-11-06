@@ -172,6 +172,58 @@ func TestRevisionLifecycle(t *testing.T) {
 	}
 }
 
+func TestOnlyOneOpenRevisionPerFamily(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	base := control.Model{
+		ID: "etch-r1", FamilyID: "etch", Name: "Etch", Revision: 1, Status: "approved", Enabled: true,
+		Indexes:    map[string]control.IndexValues{"machine": {"E1"}, "action": {"ETCH"}, "material": {"OXIDE"}},
+		Parameters: []control.ParameterDefinition{{Key: "recipe", Source: "constant", Definition: "2"}}, Outputs: []string{"recipe"},
+	}
+	data, err := json.Marshal(Config{Models: []control.Model{base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.ChangeNote = "New recipe"
+	next.CreatedBy = "ME"
+	draft, err := s.CreateRevision(base.ID, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRevision(base.ID, next); err == nil || !strings.Contains(err.Error(), "open revision") {
+		t.Fatalf("second draft should be blocked: %v", err)
+	}
+	if _, err := s.SubmitForApproval(draft.ID, "ME"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRevision(base.ID, next); err == nil || !strings.Contains(err.Error(), "open revision") {
+		t.Fatalf("draft should be blocked during pending approval: %v", err)
+	}
+	if _, err := s.WithdrawSubmission(draft.ID, "OTHER", false); err == nil {
+		t.Fatal("another engineer should not withdraw the submission")
+	}
+	withdrawn, err := s.WithdrawSubmission(draft.ID, "ME", false)
+	if err != nil || withdrawn.Status != "draft" || withdrawn.SubmittedBy != "" || withdrawn.SubmittedAt != "" {
+		t.Fatalf("withdrawal should restore editable draft: %+v %v", withdrawn, err)
+	}
+	if _, err := s.CreateRevision(base.ID, next); err == nil {
+		t.Fatal("withdrawn draft should still occupy the family's open slot")
+	}
+	if err := s.DeleteRevision(draft.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateRevision(base.ID, next); err != nil {
+		t.Fatalf("deleting the draft should free the open slot: %v", err)
+	}
+}
+
 func TestSubmissionAndApprovalRequireEnabledDataSources(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	model := control.Model{
@@ -268,6 +320,51 @@ func TestCreateModelStartsAsDraft(t *testing.T) {
 	}
 }
 
+func TestInvalidDraftCanBeSavedButNotSubmitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := control.Model{
+		Name: "Work in progress", CreatedBy: "ME", ChangeNote: "Initial draft",
+		Indexes:    map[string]control.IndexValues{"machine": {"M1"}, "action": {"ETCH"}, "material": {"OXIDE"}},
+		Parameters: []control.ParameterDefinition{{Key: "result", Source: "expression", DataType: "number", Definition: "@missing + 1"}},
+		Outputs:    []string{"result"},
+	}
+	created, err := s.CreateModel(model)
+	if err != nil {
+		t.Fatalf("invalid draft should save: %v", err)
+	}
+	if len(s.DraftValidationIssues(created)) == 0 {
+		t.Fatal("saved draft should report validation issue")
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := reopened.Model(created.ID); !exists {
+		t.Fatal("invalid draft was not persisted")
+	}
+	if _, err := reopened.SubmitForApproval(created.ID, "ME"); err == nil {
+		t.Fatal("invalid draft should not be submitted")
+	}
+	created.Parameters[0].Definition = "1 + 1"
+	updated, err := reopened.UpdateDraft(created.ID, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issues := reopened.DraftValidationIssues(updated); len(issues) != 0 {
+		t.Fatalf("fixed draft still has issues: %+v", issues)
+	}
+	if _, err := reopened.SubmitForApproval(created.ID, "ME"); err != nil {
+		t.Fatalf("fixed draft should submit: %v", err)
+	}
+}
+
 func TestModelFolderPersistsAndFollowsRevisionFamily(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"models":[]}`), 0600); err != nil {
@@ -291,6 +388,12 @@ func TestModelFolderPersistsAndFollowsRevisionFamily(t *testing.T) {
 	}
 	if err := s.DeleteFolder(folder.ID); err == nil {
 		t.Fatal("expected nonempty folder deletion to fail")
+	}
+	if _, err := s.SubmitForApproval(created.ID, "engineer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Approve(created.ID, "manager", false); err != nil {
+		t.Fatal(err)
 	}
 	revision, err := s.CreateRevision(created.ID, model)
 	if err != nil {

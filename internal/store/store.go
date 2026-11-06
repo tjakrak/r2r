@@ -870,6 +870,10 @@ func (s *Store) RecordSourceTest(id, status, message string, elapsedMS int64) (S
 func (s *Store) CreateModel(model control.Model) (control.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	model = normalizeDraftCollections(model)
+	if strings.TrimSpace(model.Name) == "" {
+		return control.Model{}, errors.New("model name is required")
+	}
 	if !s.folderExists(model.FolderID) {
 		return control.Model{}, errors.New("destination folder not found")
 	}
@@ -900,12 +904,6 @@ func (s *Store) CreateModel(model control.Model) (control.Model, error) {
 	model.ApprovedBy = ""
 	model.ApprovedAt = ""
 	model.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := validateRegisteredInputs(model, s.config.InputDefinitions); err != nil {
-		return control.Model{}, err
-	}
-	if err := control.ValidateModel(model); err != nil {
-		return control.Model{}, err
-	}
 	s.config.Models = append(s.config.Models, model)
 	return model, s.persistModels(model)
 }
@@ -941,6 +939,7 @@ func (s *Store) familyExists(familyID string) bool {
 func (s *Store) CreateRevision(baseID string, next control.Model) (control.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	next = normalizeDraftCollections(next)
 	var base *control.Model
 	maxRev := 0
 	for i := range s.config.Models {
@@ -951,6 +950,12 @@ func (s *Store) CreateRevision(baseID string, next control.Model) (control.Model
 	}
 	if base == nil {
 		return control.Model{}, errors.New("base model not found")
+	}
+	if open, exists := openRevisionForFamily(s.config.Models, base.FamilyID, ""); exists {
+		return control.Model{}, fmt.Errorf("model family already has an open revision (revision %d, %s); resolve it before creating another", open.Revision, open.Status)
+	}
+	if strings.TrimSpace(next.Name) == "" {
+		return control.Model{}, errors.New("model name is required")
 	}
 	if next.ChangeNote == "" || next.CreatedBy == "" {
 		return control.Model{}, errors.New("change note and author are required")
@@ -974,14 +979,17 @@ func (s *Store) CreateRevision(baseID string, next control.Model) (control.Model
 	next.ApprovedBy = ""
 	next.ApprovedAt = ""
 	next.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := validateRegisteredInputs(next, s.config.InputDefinitions); err != nil {
-		return control.Model{}, err
-	}
-	if err := control.ValidateModel(next); err != nil {
-		return control.Model{}, err
-	}
 	s.config.Models = append(s.config.Models, next)
 	return next, s.persistModels(next)
+}
+
+func openRevisionForFamily(models []control.Model, familyID, exceptID string) (control.Model, bool) {
+	for _, model := range models {
+		if model.FamilyID == familyID && model.ID != exceptID && (model.Status == "draft" || model.Status == "pending_approval") {
+			return model, true
+		}
+	}
+	return control.Model{}, false
 }
 
 func (s *Store) DeleteRevision(id string) error {
@@ -1006,12 +1014,16 @@ func (s *Store) DeleteRevision(id string) error {
 func (s *Store) UpdateDraft(id string, next control.Model) (control.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	next = normalizeDraftCollections(next)
 	for index, current := range s.config.Models {
 		if current.ID != id {
 			continue
 		}
 		if current.Status != "draft" {
 			return control.Model{}, errors.New("only draft revisions can be edited")
+		}
+		if strings.TrimSpace(next.Name) == "" {
+			return control.Model{}, errors.New("model name is required")
 		}
 		next.ID = current.ID
 		next.FamilyID = current.FamilyID
@@ -1029,16 +1041,32 @@ func (s *Store) UpdateDraft(id string, next control.Model) (control.Model, error
 		next.RejectionReason = current.RejectionReason
 		next.ApprovedBy = ""
 		next.ApprovedAt = ""
-		if err := validateRegisteredInputs(next, s.config.InputDefinitions); err != nil {
-			return control.Model{}, err
-		}
-		if err := control.ValidateModel(next); err != nil {
-			return control.Model{}, err
-		}
 		s.config.Models[index] = next
 		return next, s.persistModels(next)
 	}
 	return control.Model{}, errors.New("draft revision not found")
+}
+
+func normalizeDraftCollections(model control.Model) control.Model {
+	if model.Indexes == nil {
+		model.Indexes = map[string]control.IndexValues{}
+	}
+	if model.ExternalInputs == nil {
+		model.ExternalInputs = []control.ExternalInputDefinition{}
+	}
+	if model.FeedbackInputs == nil {
+		model.FeedbackInputs = []control.FeedbackInputDefinition{}
+	}
+	if model.Parameters == nil {
+		model.Parameters = []control.ParameterDefinition{}
+	}
+	if model.DataSamples == nil {
+		model.DataSamples = []control.DataSampleDefinition{}
+	}
+	if model.Outputs == nil {
+		model.Outputs = []string{}
+	}
+	return model
 }
 
 func (s *Store) DeleteFamily(id string) error {
@@ -1199,6 +1227,15 @@ func validateProductionReadyModel(model control.Model, definitions []InputDefini
 	return control.ValidateModel(model)
 }
 
+func (s *Store) DraftValidationIssues(model control.Model) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := validateProductionReadyModel(model, s.config.InputDefinitions, s.config.Sources); err != nil {
+		return []string{err.Error()}
+	}
+	return []string{}
+}
+
 func (s *Store) ModelPurgeSummary(id string) (ModelPurgeSummary, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1292,6 +1329,9 @@ func (s *Store) SubmitForApproval(id, actor string) (control.Model, error) {
 		if model.Status != "draft" {
 			return control.Model{}, errors.New("only draft revisions can be submitted for approval")
 		}
+		if open, exists := openRevisionForFamily(s.config.Models, model.FamilyID, model.ID); exists {
+			return control.Model{}, fmt.Errorf("cannot submit revision for approval: revision %d is already %s in this model family", open.Revision, open.Status)
+		}
 		if strings.TrimSpace(actor) == "" {
 			return control.Model{}, errors.New("submitter is required")
 		}
@@ -1305,6 +1345,30 @@ func (s *Store) SubmitForApproval(id, actor string) (control.Model, error) {
 		s.config.Models[index].RejectedBy = ""
 		s.config.Models[index].RejectedAt = ""
 		s.config.Models[index].RejectionReason = ""
+		if err := s.persistModels(s.config.Models[index]); err != nil {
+			return control.Model{}, err
+		}
+		return s.config.Models[index], nil
+	}
+	return control.Model{}, errors.New("model revision not found")
+}
+
+func (s *Store) WithdrawSubmission(id, actor string, allowAdmin bool) (control.Model, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, model := range s.config.Models {
+		if model.ID != id {
+			continue
+		}
+		if model.Status != "pending_approval" {
+			return control.Model{}, errors.New("only pending revisions can be withdrawn")
+		}
+		if !allowAdmin && !strings.EqualFold(strings.TrimSpace(model.SubmittedBy), strings.TrimSpace(actor)) {
+			return control.Model{}, errors.New("only the submitter or an administrator can withdraw this revision")
+		}
+		s.config.Models[index].Status = "draft"
+		s.config.Models[index].SubmittedBy = ""
+		s.config.Models[index].SubmittedAt = ""
 		if err := s.persistModels(s.config.Models[index]); err != nil {
 			return control.Model{}, err
 		}
@@ -1356,6 +1420,9 @@ func (s *Store) Approve(id, actor string, allowSelfApproval bool) (control.Model
 	target := s.config.Models[index]
 	if target.Status != "pending_approval" {
 		return control.Model{}, errors.New("only revisions pending approval can be approved")
+	}
+	if open, exists := openRevisionForFamily(s.config.Models, target.FamilyID, target.ID); exists {
+		return control.Model{}, fmt.Errorf("cannot approve revision: revision %d is also %s in this model family; resolve it first", open.Revision, open.Status)
 	}
 	if !allowSelfApproval && strings.EqualFold(strings.TrimSpace(target.SubmittedBy), strings.TrimSpace(actor)) {
 		return control.Model{}, errors.New("the submitter cannot approve their own revision")

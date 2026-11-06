@@ -221,6 +221,22 @@ func BuildDependencyGraph(model Model) (DependencyGraph, error) {
 		}
 		return fmt.Errorf("%s references unknown parameter or external input %q", displayNode(target), reference)
 	}
+	addSQLReference := func(target, reference, reason string) error {
+		if id, exists := indexIDs[strings.ToLower(reference)]; exists {
+			dependencies[target] = appendUnique(dependencies[target], id)
+			addReason(id, target, reason+" @"+reference)
+			return nil
+		}
+		if err := addParameter(target, reference); err != nil {
+			return err
+		}
+		if id := parameterIDs[strings.ToLower(reference)]; id != "" {
+			addReason(id, target, reason+" @"+reference)
+		} else if id := externalIDs[strings.ToLower(reference)]; id != "" {
+			addReason(id, target, reason+" @"+reference)
+		}
+		return nil
+	}
 	addSample := func(target, reference string) error {
 		id, exists := sampleIDs[strings.ToLower(reference)]
 		if !exists {
@@ -318,13 +334,8 @@ func BuildDependencyGraph(model Model) (DependencyGraph, error) {
 			}
 		case "sql":
 			for _, reference := range SQLReferences(parameter.Definition) {
-				if err := addParameter(target, reference); err != nil {
+				if err := addSQLReference(target, reference, "SQL query parameter"); err != nil {
 					return graph, err
-				}
-				if id := parameterIDs[strings.ToLower(reference)]; id != "" {
-					addReason(id, target, "SQL query parameter @"+reference)
-				} else if id := externalIDs[strings.ToLower(reference)]; id != "" {
-					addReason(id, target, "SQL query parameter @"+reference)
 				}
 			}
 		case "constant", "formula", "data-sample":
@@ -444,13 +455,8 @@ func BuildDependencyGraph(model Model) (DependencyGraph, error) {
 			continue
 		}
 		for _, reference := range SQLReferences(sample.Query) {
-			if err := addParameter(target, reference); err != nil {
+			if err := addSQLReference(target, reference, "Data sample SQL parameter"); err != nil {
 				return graph, err
-			}
-			if id := parameterIDs[strings.ToLower(reference)]; id != "" {
-				addReason(id, target, "Data sample SQL parameter @"+reference)
-			} else if id := externalIDs[strings.ToLower(reference)]; id != "" {
-				addReason(id, target, "Data sample SQL parameter @"+reference)
 			}
 		}
 	}
