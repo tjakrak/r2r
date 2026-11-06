@@ -10,6 +10,8 @@ R2R selects and executes versioned manufacturing control models. An external app
 - SQL Server production persistence in the `PCS` schema
 - JSON persistence in `data/config.json` when production SQL is not configured
 
+The Go server keeps startup and route registration in `cmd/server/main.go`. HTTP handlers are grouped by feature in neighboring files (for example, `users.go`, `models.go`, and `runs.go`); SQL queries and persistence remain in `internal/store`.
+
 ## Run
 
 ```bash
@@ -34,11 +36,15 @@ npm start
 
 The startup fails if SQL Server is unavailable or if the expected `PCS` tables do not match the deployed contract. `GET /api/health` reports `database: connected` in SQL mode. Copy `.env.example` only as a reference; do not commit a real password or connection string.
 
+For an existing SQL Server deployment, run [SQL/19_model_folders.sql](SQL/19_model_folders.sql) before starting this version. It creates `PCS.MODEL_FOLDERS` and adds the optional `FOLDER_ID` to `PCS.MODEL_FAMILIES`; existing models stay Unfiled. The model library can create folders, filter models by folder, and move a whole model family between folders. Creating or importing while a folder is selected places the model there.
+
 Set `R2R_EMPLOYEE_DATABASE_CONNECTION_STRING` to enable the production employee-directory placeholder. That SQL Server database must expose a read-only `dbo.R2R_EMPLOYEE_DIRECTORY` table or view with `IDNUM`, `LOGINID`, `EMAIL`, and `SUPID` columns. When the variable is absent, development mode uses the hardcoded test employee records. The credential-verification REST API remains a separate integration.
 
 Set `R2R_AUTH_API_URL` (currently `http://hwtb1web01.headway.com/HWT.API/validateuser`) to enable corporate credential verification. The backend locally converts the password to UTF-8 bytes, applies standard Base64 encoding, and posts `{"username":"...","password":"<base64 value>"}` to `validateuser`. Authentication succeeds when the response contains `{"data":{"status":"success","userInfo":{"id":"..."}}}`; `userInfo.id` must match the employee-directory ID. An optional bearer credential can be provided with `R2R_AUTH_API_KEY`. When the authentication URL is absent, the backend retains the environment-based development passwords.
 
 Open [http://localhost:4173](http://localhost:4173). The web interface manages models and revisions; model execution is performed by external applications through the API.
+
+The **Executions** page browses run history independently of Overview's latest-20 preview. Filter by local date range, status, folder, or multiple models; expand a run to inspect its recorded context, parameters, outputs, feedback, and data samples. Export up to 2,000 matching runs as a ZIP containing separate CSV files for runs, parameter values, outputs, feedback, and data samples. When exactly one model family is explicitly selected, the ZIP also includes `parameters_wide.csv`: one row per run, with `parameter.<name>` columns. A blank cell means that parameter was absent from that run; `NULL` means it was present with a null value. The production endpoint queries SQL Server directly, so older runs are not limited by the backend's in-memory recent-run cache. Export access requires an authenticated R2R session and is audit-logged.
 
 ### Development login
 
@@ -80,6 +86,10 @@ curl -X POST http://localhost:4173/api/v1/runs/prepare \
   }'
 ```
 
+Use the same request body with `POST /api/v1/runs/simulate` to execute one production-equivalent dry run. It selects the same active approved model, reads the same adaptive state, executes the same configured SQL data samples, evaluates limits, and returns the same parameters and outputs with `"status": "simulated"`. It does not create a run, persist data-sample or parameter values, update adaptive state, or return a `runId`. Operational request logging still applies.
+
+See [R2R Execution API Developer Guide](docs/developer_execution_api.md) for the complete request contract, response scenarios, persistence behavior, completion mapping, and retry guidance.
+
 The included draft example demonstrates all expression forms. References use `@name`; functions do not. The popup expression editor groups operators, conditional statements, aggregates, math functions, data-sample functions, and string functions. Expressions support typed literals, comparisons, `IF(condition, result, else_result)`, `IS_NULL(value)`, numerical operators, common math functions, `MIN`, `MAX`, `AVG`, `MEDIAN`, `RANGE`, `STDEV`, `SUM`, and `COUNT` aggregates, positional `FIRST`, `NTH`, and `LAST`, typed lookups, and string functions such as `SUBSTR`, `REPLACE`, `CONCAT`, and `TRIM`. `LOOKUP_ONE` and `LOOKUP_FIRST` return null when no row matches; use `IS_NULL` when fallback behavior is required. `CONTAINS(@sample.text_column, "value")` performs a case-insensitive exact membership check across the column and returns a boolean. `MATCHES(@sample.text_column, "^pattern$")` performs regular-expression matching. `NTH(@sample.column, 2)` selects the second row using a 1-based position. Use a deterministic SQL `ORDER BY` whenever row order matters.
 
 ## Model definition
@@ -100,7 +110,7 @@ Each model revision owns:
 - Any number of output parameter references
 - Author, change note, revision number, and lifecycle status
 
-New revisions begin as editable drafts. Submitting a draft locks it in `pending_approval`. An engineering manager may approve a direct report's revision, while an administrator may approve any pending revision. Approval supersedes the previously approved revision; submitting does not affect the active model. Only approved and enabled revisions can execute.
+New revisions begin as editable drafts. A model family may have only one open revision at a time: one draft or one pending approval. Incomplete or invalid definitions can be saved; the save response includes `validationIssues`, and the UI warns the author. Submitting a draft requires full validation, including registered inputs and enabled SQL sources, and then locks it in `pending_approval`. The submitter or an administrator can withdraw a pending submission back to draft. An engineering manager may approve a direct report's revision, while an administrator may approve any pending revision. Approval supersedes the previously approved revision; submitting does not affect the active model. Only approved and enabled revisions can execute.
 
 The Control Models screen can create a new model family as revision 1 or create a new revision from an existing family. Both workflows use forms for required and optional indexes, data samples, ordered parameters, engineering limits, and output selection. The developer payload is available behind the **View API payload** button.
 
@@ -115,24 +125,27 @@ The R2R production repository uses SQL Server. External calculation data may com
 ## API
 
 - `POST /api/login` resolves `LOGINID`, requires an active R2R registration for its `IDNUM`, and then invokes the placeholder corporate credential verifier.
-- `GET /api/users` lists R2R employee registrations for administrators.
+- `GET /api/users` lists R2R employee registrations for administrators (legacy unpaged response).
+- `GET /api/users/search?query=&role=&status=&page=1&pageSize=25` returns `{items,total,page,pageSize}` for User management. In SQL mode, filtering and pagination run directly against `PCS.USERS`; search matches employee ID, login, display name, or email. Page size is capped at 100.
 - `POST /api/users` registers an existing corporate `employeeId` with an R2R role; the prototype persists this in `data/config.json`.
 - `PUT /api/users/{employeeId}` changes an R2R role or enables/disables access. Disabling revokes the employee's active sessions while preserving model history.
 - `DELETE /api/users/{employeeId}` permanently removes an unused R2R registration without modifying the corporate employee directory. Registrations referenced by model history must be disabled instead. An administrator cannot remove their own registration or the last active administrator.
 - `POST /api/models` creates revision 1 of a new model family as a draft.
 - `POST /api/models/{id}/revisions` creates a draft revision from an existing model.
 - `POST /api/models/{id}/submit` submits and locks a draft for approval.
+- `POST /api/models/{id}/withdraw` returns a pending submission to an editable draft for its submitter or an administrator.
 - `POST /api/models/{id}/transfer` lets an administrator transfer an open draft to an active engineer or administrator while preserving its original creator.
 - `POST /api/models/{id}/approve` activates a pending revision when the approver is the submitter's direct supervisor with an approval role, or when the approver is an administrator.
 - `POST /api/models/{id}/reject` returns a pending revision to draft with a required reason.
 - `GET /api/models/{id}/history` returns immutable revision history.
-- `POST /api/v1/runs/prepare` selects the active revision, resolves values, and records a prepared run.
+- `POST /api/v1/runs/prepare` selects the active revision, resolves values, and records a prepared run. Valid indexes with no matching approved model return `status: no_match`, `disposition: no_control_recommendation`, and an empty output list without creating a run.
+- `POST /api/v1/runs/simulate` accepts the production prepare request and returns a single-run production-equivalent preview without creating a run or changing adaptive state.
 - `POST /api/v1/runs/{runId}/complete` records completion feedback and post-run adaptive updates.
 - `POST /api/simulate` runs each row of an uploaded CSV through the active model without committing adaptive updates.
 
 The Simulation page follows a model-first workflow: select an active model, download its generated CSV template, populate and upload the file, then run the simulation. After a run, **View JSON exchange** shows the exact simulation request and response. Draft simulation provides the same template and exchange viewer for the selected revision.
 
-Scalar SQL parameters and tabular data samples execute one read-only `SELECT` against their configured external source. Values are bound through `database/sql` and are never interpolated into query text. Declared SQL sample schemas normalize and validate returned column names and types before expressions or lookups execute. Data-sample results are limited to the configured record count. The source's `secretRef` names the environment variable containing its password. Production callers send routing values in `indexes` and declared calculation inputs in `externalInputs`; approved parameter definitions always resolve inside R2R. Only `machine`, `action`, and `material` are globally required indexes. Additional registered indexes may be omitted when a less-specific approved model is intended. Caller-supplied sample rows and test values are confined to the Simulation API.
+Scalar SQL parameters and tabular data samples execute one read-only `SELECT` against their configured external source. Values are bound through `database/sql` and are never interpolated into query text. Declared SQL sample schemas normalize and validate returned column names and types before expressions or lookups execute. Data-sample results are limited to the configured record count. The source's `secretRef` names the environment variable containing its password. Production callers send routing values in `indexes` and calculation inputs in `externalInputs`; approved parameter definitions always resolve inside R2R. The selected model uses only its declared external inputs and reports unused names in `ignoredExternalInputs`. Declared inputs are still required and type-checked. Only `machine`, `action`, and `material` are globally required indexes. Additional registered indexes may be omitted when a less-specific approved model is intended. Caller-supplied sample rows and test values are confined to the Simulation API.
 
 Static data samples store their typed column definitions and rows directly with the model revision. They resolve without a database connection and support the same aggregate and positional expressions as SQL samples.
 
