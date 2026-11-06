@@ -1563,6 +1563,12 @@ main > header {
 .model-detail-buttons .chart-open-button {
   margin: 0;
 }
+.model-detail-message {
+  margin: 8px 0 0;
+  color: #5d6870;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .model-detail-tools svg {
   width: 14px;
   height: 14px;
@@ -1722,13 +1728,78 @@ main > header {
   color: #a84444 !important;
   font-weight: 700;
 }
-.timeline-item p.revision-validation-message {
+.revision-validation-details {
   max-width: 650px;
-  padding: 9px 11px;
-  border-left: 3px solid #be5945;
-  background: #fff4f1;
-  color: #884035;
+  margin: 10px 0;
+  padding: 9px 12px;
+  border-left: 3px solid #b98b37;
+  background: #fff9eb;
+  color: #574724;
   overflow-wrap: anywhere;
+}
+.revision-validation-details summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 750;
+}
+.revision-validation-details ul {
+  margin: 10px 0 2px;
+  padding-left: 20px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.revision-validation-details li + li {
+  margin-top: 6px;
+}
+.draft-save-toast {
+  position: fixed;
+  z-index: 140;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  box-sizing: border-box;
+  width: min(390px, calc(100vw - 40px));
+  padding: 14px 15px;
+  border: 1px solid #b8d4c3;
+  border-radius: 8px;
+  background: #f5fbf7;
+  box-shadow: 0 10px 30px #172b2026;
+  color: #234d36;
+}
+.draft-save-toast > svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+}
+.draft-save-toast > div {
+  flex: 1;
+  min-width: 0;
+}
+.draft-save-toast strong,
+.draft-save-toast span {
+  display: block;
+}
+.draft-save-toast strong {
+  font-size: 12px;
+}
+.draft-save-toast span {
+  margin-top: 3px;
+  color: #4c6657;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.draft-save-toast button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #547363;
+  cursor: pointer;
+}
+.draft-save-toast button svg {
+  width: 16px;
+  height: 16px;
 }
 .drawer-error {
   margin: 0 22px;

@@ -95,6 +95,69 @@ func TestTypedExpressionSupportsAggregateMathAndStringFunctions(t *testing.T) {
 	}
 }
 
+func TestTypedExpressionConvertsTextAndNumbers(t *testing.T) {
+	model := expressionTestModel()
+	refs := map[string]string{"base": "number", "label": "string"}
+	tests := []struct {
+		expression string
+		typeName   string
+		want       interface{}
+	}{
+		{`CONCAT("A", 1, "-", @base)`, "string", "A1-2"},
+		{`CONCAT("A", TO_TEXT(1, 2))`, "string", "A1.00"},
+		{`TO_TEXT(1.00)`, "string", "1"},
+		{`TO_TEXT(1.234, 2)`, "string", "1.23"},
+		{`TO_TEXT(1, 0)`, "string", "1"},
+		{`TO_NUMBER(" 12.5 ") + @base`, "number", float64(14.5)},
+		{`TO_NUMBER(@label)`, "number", float64(2.5)},
+		{`TO_TEXT(TO_NUMBER("1.5"), 2)`, "string", "1.50"},
+		{`TO_TEXT(@base)`, "string", "2"},
+	}
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			if err := ValidateTypedExpression(test.expression, test.typeName, model, refs); err != nil {
+				t.Fatalf("validation failed: %v", err)
+			}
+			got, err := EvaluateTypedExpression(test.expression, test.typeName, model, map[string]interface{}{"label": "2.5"}, map[string]interface{}{"base": float64(2)}, nil)
+			if err != nil || got != test.want {
+				t.Fatalf("got %#v, %v; want %#v", got, err, test.want)
+			}
+		})
+	}
+	for _, expression := range []string{
+		`TO_TEXT("1")`, `TO_NUMBER(1)`, `CONCAT("A", true)`,
+		`TO_TEXT(1, "2")`, `TO_TEXT()`, `TO_NUMBER("1", "2")`,
+	} {
+		if err := ValidateTypedExpression(expression, "string", model, refs); err == nil {
+			t.Errorf("expected validation to reject %s", expression)
+		}
+	}
+	for _, expression := range []string{
+		`TO_NUMBER("not a number")`, `TO_NUMBER("NaN")`,
+		`TO_TEXT(1, -1)`, `TO_TEXT(1, 1.5)`, `TO_TEXT(1, 16)`,
+	} {
+		typeName := "string"
+		if strings.HasPrefix(expression, "TO_NUMBER") {
+			typeName = "number"
+		}
+		if _, err := EvaluateTypedExpression(expression, typeName, model, nil, nil, nil); err == nil {
+			t.Errorf("expected evaluation to reject %s", expression)
+		}
+	}
+	for _, test := range []struct {
+		expression string
+		typeName   string
+	}{
+		{`TO_TEXT(@base)`, "string"},
+		{`TO_NUMBER(@label)`, "number"},
+	} {
+		got, err := EvaluateTypedExpression(test.expression, test.typeName, model, map[string]interface{}{"label": nil}, map[string]interface{}{"base": nil}, nil)
+		if err != nil || got != nil {
+			t.Errorf("expected %s to preserve NULL, got %#v, %v", test.expression, got, err)
+		}
+	}
+}
+
 func TestTypedExpressionRoundsNestedLookupResult(t *testing.T) {
 	model := Model{DataSamples: []DataSampleDefinition{{
 		Key: "afm_data", Source: "static",

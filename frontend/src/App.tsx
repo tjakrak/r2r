@@ -343,7 +343,7 @@ export default function App() {
   const [view, setView] = useState('overview');
   const [mobile, setMobile] = useState(false);
   const [selected, setSelected] = useState<Model>();
-  const [draftIssues, setDraftIssues] = useState<string[]>([]);
+  const [draftNotice, setDraftNotice] = useState<{ title: string; issueCount: number } | null>(null);
   const [importingModel, setImportingModel] = useState(false);
   const [importFolderId, setImportFolderId] = useState('');
   const [editingSource, setEditingSource] = useState<Source>();
@@ -368,6 +368,11 @@ export default function App() {
       .catch(() => undefined)
       .finally(() => setCheckingSession(false));
   }, []);
+  useEffect(() => {
+    if (!draftNotice) return;
+    const timer = window.setTimeout(() => setDraftNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [draftNotice]);
   useEffect(() => {
     const handleSessionExpired = () => {
       setUser(undefined);
@@ -785,24 +790,20 @@ export default function App() {
           onChanged={async (issues) => {
             await load();
             setSelected(undefined);
-            if (issues?.length) setDraftIssues(issues);
+            if (issues !== undefined) setDraftNotice({ title: 'Draft saved', issueCount: issues.length });
           }}
         />
       )}
-      {draftIssues.length > 0 && (
-        <div
-          className="payload-backdrop action-error-backdrop"
-          onMouseDown={(event) => event.target === event.currentTarget && setDraftIssues([])}
-        >
-          <section className="action-error-dialog" role="alertdialog" aria-modal="true">
-            <div className="action-error-icon"><CircleAlert /></div>
-            <div>
-              <p>DRAFT SAVED</p>
-              <h3>Fix this before submitting for approval</h3>
-              {draftIssues.map((issue, index) => <span key={`${index}-${issue}`}>{issue}</span>)}
-            </div>
-            <button className="primary" onClick={() => setDraftIssues([])} autoFocus>OK</button>
-          </section>
+      {draftNotice && (
+        <div className="draft-save-toast" role="status" aria-live="polite">
+          <Check aria-hidden="true" />
+          <div>
+            <strong>{draftNotice.title}</strong>
+            {draftNotice.issueCount > 0 && (
+              <span>{draftNotice.issueCount} {draftNotice.issueCount === 1 ? 'item' : 'items'} to resolve before submitting for approval.</span>
+            )}
+          </div>
+          <button type="button" aria-label="Dismiss notification" onClick={() => setDraftNotice(null)}><X /></button>
         </div>
       )}
       {importingModel && (
@@ -814,7 +815,7 @@ export default function App() {
             await load();
             setImportingModel(false);
             setSelected(model);
-            if (model.validationIssues?.length) setDraftIssues(model.validationIssues);
+            setDraftNotice({ title: 'Draft imported', issueCount: model.validationIssues?.length || 0 });
           }}
         />
       )}
@@ -1705,8 +1706,13 @@ function Documentation() {
               </article>
               <article>
                 <strong>String functions</strong>
-                <span>Clean and combine text values.</span>
-                <pre>{`CONCAT(UPPER(TRIM(@operation)), "_RECIPE")`}</pre>
+                <span>Clean and combine text values. CONCAT also accepts numbers and uses their shortest decimal form.</span>
+                <pre>{`CONCAT(UPPER(TRIM(@operation)), "_RECIPE_", @step_number)`}</pre>
+              </article>
+              <article>
+                <strong>Convert between text and numbers</strong>
+                <span>TO_TEXT accepts an optional fixed decimal-place count from 0 to 15. TO_NUMBER reports an error for non-numeric text.</span>
+                <pre>{`TO_TEXT(@target, 2)  →  "1.00" when @target is 1\nTO_NUMBER("12.5")  →  12.5`}</pre>
               </article>
             </div>
             <div className="documentation-note">
@@ -3923,6 +3929,8 @@ function ModelDrawer({
   const [showPayload, setShowPayload] = useState(false);
   const [payloadView, setPayloadView] = useState<'request' | 'response' | 'contract'>('request');
   const [showHistoryChart, setShowHistoryChart] = useState(false);
+  const [historyChartLoading, setHistoryChartLoading] = useState(false);
+  const [historyChartMessage, setHistoryChartMessage] = useState('');
   const [showManageMenu, setShowManageMenu] = useState(false);
   const manageMenuRef = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState(false);
@@ -4052,6 +4060,24 @@ function ModelDrawer({
   const refreshHistory = async () => {
     if (model.id) setHistory(await api<Model[]>(`/api/models/${model.id}/history`));
   };
+  const openHistoryChart = async () => {
+    if (!model.id || historyChartLoading) return;
+    setHistoryChartLoading(true);
+    setHistoryChartMessage('');
+    try {
+      const recentRuns = await api<RunRecord[]>(`/api/models/${model.id}/runs?days=30`);
+      if (!recentRuns.length) {
+        setHistoryChartMessage('No runs to chart in the last 30 days.');
+        return;
+      }
+      setRuns(recentRuns);
+      setShowHistoryChart(true);
+    } catch (reason) {
+      setHistoryChartMessage(`Could not load run history: ${(reason as Error).message}`);
+    } finally {
+      setHistoryChartLoading(false);
+    }
+  };
   const downloadRevisionJSON = (revision: Model) => {
     const safeName = (revision.name || revision.familyId || 'model')
       .trim()
@@ -4075,7 +4101,6 @@ function ModelDrawer({
   useEffect(() => {
     if (model.id) {
       refreshHistory();
-      api<RunRecord[]>(`/api/models/${model.id}/runs?days=30`).then(setRuns);
     }
   }, [model.id]);
   const updateInput = (i: number, next: Parameter) =>
@@ -4407,14 +4432,15 @@ function ModelDrawer({
                   {model.status === 'approved' && (
                     <button
                       className="secondary chart-open-button"
-                      disabled={!historyChartSeries.length}
-                      onClick={() => setShowHistoryChart(true)}
+                      disabled={historyChartLoading || !historyChartSeries.length}
+                      onClick={() => void openHistoryChart()}
                     >
-                      <LineChart />
-                      View run trend chart
+                      {historyChartLoading ? <LoaderCircle className="button-spinner" /> : <LineChart />}
+                      {historyChartLoading ? 'Loading chart…' : 'View run trend chart'}
                     </button>
                   )}
                 </div>
+                {historyChartMessage && <p className="model-detail-message" role="status">{historyChartMessage}</p>}
               </div>
               <div className="model-detail-group">
                 <span>MODEL TOOLS</span>
@@ -4511,9 +4537,14 @@ function ModelDrawer({
                       </p>
                     )}
                     {item.status === 'draft' && !!item.validationIssues?.length && (
-                      <p className="revision-validation-message" role="status">
-                        Submission blocked: {item.validationIssues[0]}
-                      </p>
+                      <details className="revision-validation-details">
+                        <summary>
+                          {item.validationIssues.length} {item.validationIssues.length === 1 ? 'item' : 'items'} to resolve before submitting for approval
+                        </summary>
+                        <ul>
+                          {item.validationIssues.map((issue, index) => <li key={`${index}-${issue}`}>{issue}</li>)}
+                        </ul>
+                      </details>
                     )}
                     <div className="revision-actions">
                       <button

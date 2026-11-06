@@ -205,6 +205,13 @@ func explainExpressionNode(node ast.Expr) string {
 			}
 		case "CONCAT":
 			return "join " + strings.Join(arguments, ", ")
+		case "TO_TEXT":
+			if len(arguments) == 2 {
+				return fmt.Sprintf("format %s as text with %s decimal places", arguments[0], arguments[1])
+			}
+			return describeSingleArgument("convert to text", arguments)
+		case "TO_NUMBER":
+			return describeSingleArgument("convert to a number", arguments)
 		case "REPLACE":
 			if len(arguments) == 3 {
 				return fmt.Sprintf("replace %s with %s in %s", arguments[1], arguments[2], arguments[0])

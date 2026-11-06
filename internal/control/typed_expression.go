@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -153,7 +154,7 @@ func evalTypedNode(node ast.Expr, model Model, context, values map[string]interf
 		if name == "CONTAINS" || name == "MATCHES" {
 			return evaluateSampleMembership(name, n, model, context, values, samples)
 		}
-		if name == "SUBSTR" || name == "REPLACE" || name == "LOWER" || name == "UPPER" || name == "TRIM" || name == "CONCAT" || name == "LEN" {
+		if name == "SUBSTR" || name == "REPLACE" || name == "LOWER" || name == "UPPER" || name == "TRIM" || name == "CONCAT" || name == "LEN" || name == "TO_TEXT" || name == "TO_NUMBER" {
 			return evalStringCall(name, n.Args, model, context, values, samples)
 		}
 		text, err := expressionText(n)
@@ -265,6 +266,42 @@ func evalStringCall(name string, arguments []ast.Expr, model Model, context, val
 		return value, nil
 	}
 	switch name {
+	case "TO_TEXT":
+		if len(resolved) != 1 && len(resolved) != 2 {
+			return nil, fmt.Errorf("TO_TEXT requires a number and an optional number of decimal places")
+		}
+		if resolved[0] == nil {
+			return nil, nil
+		}
+		number, err := numberValue(resolved[0])
+		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+			return nil, fmt.Errorf("TO_TEXT requires a finite number")
+		}
+		places := -1
+		if len(resolved) == 2 {
+			precision, err := numberValue(resolved[1])
+			if err != nil || math.IsNaN(precision) || math.IsInf(precision, 0) || precision != math.Trunc(precision) || precision < 0 || precision > 15 {
+				return nil, fmt.Errorf("TO_TEXT decimal places must be a whole number from 0 to 15")
+			}
+			places = int(precision)
+		}
+		return strconv.FormatFloat(number, 'f', places, 64), nil
+	case "TO_NUMBER":
+		if len(resolved) != 1 {
+			return nil, fmt.Errorf("TO_NUMBER requires one text argument")
+		}
+		if resolved[0] == nil {
+			return nil, nil
+		}
+		text, err := textArg(0)
+		if err != nil {
+			return nil, err
+		}
+		number, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+			return nil, fmt.Errorf("TO_NUMBER cannot convert %q to a finite number", text)
+		}
+		return number, nil
 	case "LOWER", "UPPER", "TRIM", "LEN":
 		if len(resolved) != 1 {
 			return nil, fmt.Errorf("%s requires one argument", name)
@@ -305,12 +342,16 @@ func evalStringCall(name string, arguments []ast.Expr, model Model, context, val
 			return nil, fmt.Errorf("CONCAT requires at least two arguments")
 		}
 		var builder strings.Builder
-		for index := range resolved {
-			text, err := textArg(index)
-			if err != nil {
-				return nil, err
+		for index, value := range resolved {
+			if text, ok := value.(string); ok {
+				builder.WriteString(text)
+				continue
 			}
-			builder.WriteString(text)
+			number, err := numberValue(value)
+			if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+				return nil, fmt.Errorf("CONCAT argument %d must be text or a finite number", index+1)
+			}
+			builder.WriteString(strconv.FormatFloat(number, 'f', -1, 64))
 		}
 		return builder.String(), nil
 	case "SUBSTR":
@@ -635,6 +676,27 @@ func inferTypedNode(node ast.Expr, model Model, refs map[string]string) (string,
 			}
 			return "number", nil
 		}
+		if name == "TO_TEXT" || name == "TO_NUMBER" {
+			if name == "TO_TEXT" && len(n.Args) != 1 && len(n.Args) != 2 {
+				return "", fmt.Errorf("TO_TEXT requires a number and an optional number of decimal places")
+			}
+			if name == "TO_NUMBER" && len(n.Args) != 1 {
+				return "", fmt.Errorf("TO_NUMBER requires one text argument")
+			}
+			for index, argument := range n.Args {
+				typ, err := inferTypedNode(argument, model, refs)
+				if err != nil {
+					return "", err
+				}
+				if name == "TO_TEXT" && typ != "number" || name == "TO_NUMBER" && typ != "string" {
+					return "", fmt.Errorf("%s argument %d has the wrong type", name, index+1)
+				}
+			}
+			if name == "TO_NUMBER" {
+				return "number", nil
+			}
+			return "string", nil
+		}
 		if name == "SUBSTR" || name == "REPLACE" || name == "LOWER" || name == "UPPER" || name == "TRIM" || name == "CONCAT" || name == "LEN" {
 			expected := map[string]int{"SUBSTR": 3, "REPLACE": 3, "LOWER": 1, "UPPER": 1, "TRIM": 1, "LEN": 1}
 			if count, fixed := expected[name]; fixed && len(n.Args) != count {
@@ -649,7 +711,7 @@ func inferTypedNode(node ast.Expr, model Model, refs map[string]string) (string,
 					return "", err
 				}
 				numerical := name == "SUBSTR" && index > 0
-				if (numerical && typ != "number") || (!numerical && typ != "string") {
+				if (numerical && typ != "number") || (!numerical && name != "CONCAT" && typ != "string") || (name == "CONCAT" && typ != "string" && typ != "number") {
 					return "", fmt.Errorf("%s argument %d has the wrong type", name, index+1)
 				}
 			}

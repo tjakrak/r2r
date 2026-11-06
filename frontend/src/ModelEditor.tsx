@@ -748,7 +748,9 @@ Object.assign(functionHelp, {
   LOWER: { signature: 'LOWER(@text)', description: 'Converts text to lowercase.' },
   UPPER: { signature: 'UPPER(@text)', description: 'Converts text to uppercase.' },
   TRIM: { signature: 'TRIM(@text)', description: 'Removes surrounding whitespace.' },
-  CONCAT: { signature: 'CONCAT(value, value)', description: 'Joins text values.' },
+  CONCAT: { signature: 'CONCAT(value, value, …)', description: 'Joins two or more text or numerical values. Numbers use their shortest decimal form.' },
+  TO_TEXT: { signature: 'TO_TEXT(@number, decimal_places)', description: 'Converts a number to text. Add an optional second argument (0–15) for fixed decimal places: TO_TEXT(1, 2) returns "1.00".' },
+  TO_NUMBER: { signature: 'TO_NUMBER(@text)', description: 'Converts numerical text to a number; invalid text produces an error.' },
   LEN: { signature: 'LEN(@text)', description: 'Returns the number of characters.' },
 });
 
@@ -887,6 +889,8 @@ const expressionGroups = [
       ['Uppercase', 'UPPER(@text)'],
       ['Trim', 'TRIM(@text)'],
       ['Concatenate', 'CONCAT(@text, "suffix")'],
+      ['Number to text', 'TO_TEXT(@number)'],
+      ['Text to number', 'TO_NUMBER(@text)'],
       ['Length', 'LEN(@text)'],
     ],
   },
@@ -5129,6 +5133,8 @@ function ParameterSourceEditor({
               { name: 'UPPER(@text)', source: 'String function', plain: true },
               { name: 'TRIM(@text)', source: 'String function', plain: true },
               { name: 'CONCAT(@text, "suffix")', source: 'String function', plain: true },
+              { name: 'TO_TEXT(@number)', source: 'Conversion function', plain: true },
+              { name: 'TO_NUMBER(@text)', source: 'Conversion function', plain: true },
               { name: 'LEN(@text)', source: 'String function', plain: true },
             ],
             ...((parameter.dataType || 'number') === 'number'
