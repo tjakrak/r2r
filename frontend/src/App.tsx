@@ -1,4 +1,4 @@
-import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BookOpen,
@@ -18,6 +18,8 @@ import {
   FolderOpen,
   Gauge,
   GitBranch,
+  LineChart,
+  List,
   LogOut,
   LoaderCircle,
   Menu,
@@ -175,7 +177,9 @@ type Model = {
   dataSamples: DataSample[];
   outputs: string[];
   enabled: boolean;
+  validationIssues?: string[];
 };
+type SavedDraft = Model & { validationIssues?: string[] };
 type ModelFolder = {
   id: string;
   name: string;
@@ -210,6 +214,8 @@ type ActivityRow = {
 };
 type RunRecord = {
   runId: string;
+  familyId: string;
+  modelId: string;
   preparedAt: string;
   completedAt?: string;
   status: string;
@@ -228,7 +234,15 @@ type RunRecord = {
     limitAction?: string;
   }[];
   feedback?: Record<string, unknown>;
+  dataSamples?: Record<string, Record<string, unknown>[]>;
+  requestId?: string;
+  failureCode?: string;
+  failureMessage?: string;
 };
+type RunSearchResult = { runs: RunRecord[]; total: number };
+function executionStatusClass(status: string): string {
+  return ['completed', 'prepared', 'run_failed', 'run_cancelled'].includes(status) ? status : 'inactive';
+}
 type ChartPoint = {
   label: string;
   value: number;
@@ -263,8 +277,9 @@ type RegisteredUser = User & {
   employeeId: string;
   displayName?: string;
   email?: string;
-  status?: 'active' | 'disabled';
+  status?: 'active' | 'disabled' | 'locked';
 };
+type UserSearchResult = { items: RegisteredUser[]; total: number; page: number; pageSize: number };
 const newModel = (): Model => ({
   id: '',
   familyId: '',
@@ -328,6 +343,7 @@ export default function App() {
   const [view, setView] = useState('overview');
   const [mobile, setMobile] = useState(false);
   const [selected, setSelected] = useState<Model>();
+  const [draftIssues, setDraftIssues] = useState<string[]>([]);
   const [importingModel, setImportingModel] = useState(false);
   const [importFolderId, setImportFolderId] = useState('');
   const [editingSource, setEditingSource] = useState<Source>();
@@ -338,6 +354,7 @@ export default function App() {
   const [overviewScope, setOverviewScope] = useState<'relevant' | 'all'>('relevant');
   const [executionModel, setExecutionModel] = useState('');
   const [executionStatus, setExecutionStatus] = useState('');
+  const [executionFocusFamily, setExecutionFocusFamily] = useState('');
   const load = async () => {
     setConfig(await api('/api/config'));
     setActivity(await api('/api/runs/recent'));
@@ -415,6 +432,7 @@ export default function App() {
   const nav: [string, string, typeof Gauge][] = [
     ['overview', 'Overview', Gauge],
     ['models', 'Control models', GitBranch],
+    ['executions', 'Executions', List],
     ['sources', 'Data sources', Database],
     ['inputs', 'Input registry', SlidersHorizontal],
     ...(user?.role === 'admin' ? ([['users', 'User management', Users]] as [string, string, typeof Gauge][]) : []),
@@ -541,25 +559,32 @@ export default function App() {
                 title="Recent executions"
                 subtitle="Latest model runs with resolved parameter values"
                 action={
-                  <button className="icon" onClick={load}>
-                    <RefreshCw />
-                  </button>
+                  <div className="recent-execution-actions">
+                    <button className="secondary" onClick={() => { setExecutionFocusFamily(''); setView('executions'); }}>View all</button>
+                    <button className="icon" onClick={load} aria-label="Refresh recent executions"><RefreshCw /></button>
+                  </div>
                 }
               >
                 <div className="execution-filters">
-                  <select value={executionModel} onChange={(event) => setExecutionModel(event.target.value)}>
-                    <option value="">All models</option>
-                    {[...new Map(activity.map((row) => [row.familyId, row.model.replace(/ · Rev \d+$/, '')])).entries()].map(
-                      ([familyId, name]) => <option key={familyId} value={familyId}>{name}</option>,
-                    )}
-                  </select>
-                  <select value={executionStatus} onChange={(event) => setExecutionStatus(event.target.value)}>
-                    <option value="">All statuses</option>
-                    <option value="completed">Completed</option>
-                    <option value="prepared">Prepared</option>
-                    <option value="run_failed">Failed</option>
-                    <option value="run_cancelled">Cancelled</option>
-                  </select>
+                  <span className="execution-filter-select">
+                    <select aria-label="Filter executions by model" value={executionModel} onChange={(event) => setExecutionModel(event.target.value)}>
+                      <option value="">All models</option>
+                      {[...new Map(activity.map((row) => [row.familyId, row.model.replace(/ · Rev \d+$/, '')])).entries()].map(
+                        ([familyId, name]) => <option key={familyId} value={familyId}>{name}</option>,
+                      )}
+                    </select>
+                    <ChevronDown aria-hidden="true" />
+                  </span>
+                  <span className="execution-filter-select">
+                    <select aria-label="Filter executions by status" value={executionStatus} onChange={(event) => setExecutionStatus(event.target.value)}>
+                      <option value="">All statuses</option>
+                      <option value="completed">Completed</option>
+                      <option value="prepared">Prepared</option>
+                      <option value="run_failed">Failed</option>
+                      <option value="run_cancelled">Cancelled</option>
+                    </select>
+                    <ChevronDown aria-hidden="true" />
+                  </span>
                 </div>
                 {overviewActivity.length ? (
                   <div className="activity-list execution-activity-list">
@@ -571,7 +596,7 @@ export default function App() {
                             <small>{row.reason} · {formatDate(row.time)}</small>
                           </div>
                           <div className="execution-summary-tags">
-                            <span className={`status ${row.status === 'completed' ? 'approved' : row.status.includes('failed') ? 'draft' : 'pending_approval'}`}>
+                            <span className={`status ${executionStatusClass(row.status)}`}>
                               {row.status.replace('run_', '').toUpperCase()}
                             </span>
                             <span>{row.model}</span>
@@ -668,6 +693,9 @@ export default function App() {
         {view === 'simulation' && (
           <Simulation models={approved.filter((model) => model.enabled)} />
         )}
+        {view === 'executions' && (
+          <ExecutionsPage models={controlModels} folders={config?.folders || []} initialFamilyId={executionFocusFamily} />
+        )}
         {view === 'documentation' && <Documentation />}
         {view === 'users' && user.role === 'admin' && <UserManagement />}
         {view === 'inputs' && (
@@ -752,12 +780,30 @@ export default function App() {
           registeredUsers={config?.users || []}
           role={user.role}
           currentEmployeeId={user.employeeId}
+          onViewExecutions={() => { setExecutionFocusFamily(selected.familyId); setSelected(undefined); setView('executions'); }}
           onClose={() => setSelected(undefined)}
-          onChanged={async () => {
+          onChanged={async (issues) => {
             await load();
             setSelected(undefined);
+            if (issues?.length) setDraftIssues(issues);
           }}
         />
+      )}
+      {draftIssues.length > 0 && (
+        <div
+          className="payload-backdrop action-error-backdrop"
+          onMouseDown={(event) => event.target === event.currentTarget && setDraftIssues([])}
+        >
+          <section className="action-error-dialog" role="alertdialog" aria-modal="true">
+            <div className="action-error-icon"><CircleAlert /></div>
+            <div>
+              <p>DRAFT SAVED</p>
+              <h3>Fix this before submitting for approval</h3>
+              {draftIssues.map((issue, index) => <span key={`${index}-${issue}`}>{issue}</span>)}
+            </div>
+            <button className="primary" onClick={() => setDraftIssues([])} autoFocus>OK</button>
+          </section>
+        </div>
       )}
       {importingModel && (
         <ModelImportDialog
@@ -768,6 +814,7 @@ export default function App() {
             await load();
             setImportingModel(false);
             setSelected(model);
+            if (model.validationIssues?.length) setDraftIssues(model.validationIssues);
           }}
         />
       )}
@@ -792,6 +839,163 @@ export default function App() {
         />
       )}
     </div>
+  );
+}
+
+type ExecutionFilters = { from: string; to: string; status: string; folderId: string; familyIds: string[] };
+const localDate = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+
+function executionFilterError(filters: ExecutionFilters): string {
+  if (!filters.from || !filters.to || filters.from > filters.to) return 'Choose a valid start and end date.';
+  if (filters.familyIds.length > 100) return 'Select at most 100 models. Use the folder filter for larger groups.';
+  const start = new Date(`${filters.from}T00:00:00`);
+  const end = new Date(`${filters.to}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 'Choose a valid start and end date.';
+  if ((end.getTime() - start.getTime()) / 86400000 > 365) return 'Choose a date range of one year or less.';
+  return '';
+}
+
+function executionSearchPath(filters: ExecutionFilters, page: number, exportFile = false): string {
+  const toExclusive = new Date(`${filters.to}T00:00:00`);
+  toExclusive.setDate(toExclusive.getDate() + 1);
+  const query = new URLSearchParams({
+    from: new Date(`${filters.from}T00:00:00`).toISOString(),
+    to: toExclusive.toISOString(),
+    page: String(page),
+  });
+  if (filters.status) query.set('status', filters.status);
+  if (filters.folderId) query.set('folderId', filters.folderId);
+  filters.familyIds.forEach((id) => query.append('familyId', id));
+  return `/api/runs${exportFile ? '/export' : ''}?${query}`;
+}
+
+function ExecutionsPage({ models, folders, initialFamilyId }: { models: Model[]; folders: ModelFolder[]; initialFamilyId: string }) {
+  const initialTo = localDate(new Date());
+  const initialFromDate = new Date();
+  initialFromDate.setDate(initialFromDate.getDate() - 29);
+  const initial: ExecutionFilters = { from: localDate(initialFromDate), to: initialTo, status: '', folderId: '', familyIds: initialFamilyId ? [initialFamilyId] : [] };
+  const [filters, setFilters] = useState<ExecutionFilters>(initial);
+  const [applied, setApplied] = useState<ExecutionFilters>(initial);
+  const [page, setPage] = useState(1);
+  const [result, setResult] = useState<RunSearchResult>({ runs: [], total: 0 });
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState('');
+  const modelPickerRef = useRef<HTMLDetailsElement>(null);
+  const modelNames = useMemo(() => new Map(models.map((model) => [model.familyId, model.name])), [models]);
+  const availableModels = models.filter((model) => !filters.folderId || model.folderId === filters.folderId);
+  const totalPages = Math.max(1, Math.ceil(result.total / 50));
+  useEffect(() => {
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (modelPickerRef.current && !modelPickerRef.current.contains(event.target as Node)) {
+        modelPickerRef.current.open = false;
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && modelPickerRef.current) modelPickerRef.current.open = false;
+    };
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, []);
+  useEffect(() => {
+    let live = true;
+    const validationError = executionFilterError(filters);
+    if (validationError) {
+      setError(validationError);
+      setResult({ runs: [], total: 0 });
+      setLoading(false);
+      return () => { live = false; };
+    }
+    setLoading(true);
+    setError('');
+    setResult({ runs: [], total: 0 });
+    const timer = window.setTimeout(() => {
+      api<RunSearchResult>(executionSearchPath(filters, page))
+        .then((data) => {
+          if (live) {
+            setResult(data);
+            setApplied(filters);
+          }
+        })
+        .catch((reason) => { if (live) setError((reason as Error).message); })
+        .finally(() => { if (live) setLoading(false); });
+    }, page === 1 ? 400 : 0);
+    return () => { live = false; window.clearTimeout(timer); };
+  }, [filters, page]);
+  const changeFilters = (next: ExecutionFilters) => {
+    setPage(1);
+    setFilters(next);
+  };
+  const exportRuns = async () => {
+    setExporting(true);
+    setError('');
+    try {
+      const response = await fetch(appPath(executionSearchPath(applied, 1, true)), { credentials: 'same-origin' });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Export failed with HTTP ${response.status}`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `r2r-executions-${applied.from}-to-${applied.to}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setExporting(false);
+    }
+  };
+  return (
+    <section className="page executions-page">
+      <PageTitle eyebrow="RUN HISTORY" title="Executions" subtitle="Inspect production runs and export their recorded values." />
+      <section className="execution-search-panel" aria-label="Execution filters">
+        <div className="execution-search-fields">
+          <label>From <input type="date" value={filters.from} onChange={(event) => changeFilters({ ...filters, from: event.target.value })} /></label>
+          <label>To <input type="date" value={filters.to} onChange={(event) => changeFilters({ ...filters, to: event.target.value })} /></label>
+          <label>Status <select value={filters.status} onChange={(event) => changeFilters({ ...filters, status: event.target.value })}>
+            <option value="">All statuses</option><option value="prepared">Prepared</option><option value="completed">Completed</option><option value="run_failed">Failed</option><option value="run_cancelled">Cancelled</option>
+          </select><ChevronDown aria-hidden="true" /></label>
+          <label>Folder <select value={filters.folderId} onChange={(event) => changeFilters({ ...filters, folderId: event.target.value, familyIds: [] })}>
+            <option value="">All folders</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+          </select><ChevronDown aria-hidden="true" /></label>
+          <details className="execution-model-picker" ref={modelPickerRef}>
+            <summary>Models <span>{filters.familyIds.length ? `${filters.familyIds.length} selected` : 'All models'}</span><ChevronDown /></summary>
+            <div>{availableModels.map((model) => <label key={model.familyId}><input type="checkbox" checked={filters.familyIds.includes(model.familyId)} onChange={(event) => changeFilters({ ...filters, familyIds: event.target.checked ? [...filters.familyIds, model.familyId] : filters.familyIds.filter((id) => id !== model.familyId) })} />{model.name}</label>)}</div>
+          </details>
+        </div>
+        <p className="execution-search-note">Results update automatically. Dates use your local time zone. Export is limited to 2,000 matching runs.{applied.familyIds.length === 1 ? ' The ZIP includes a wide parameter CSV for this model.' : ''}</p>
+      </section>
+      {error && <p className="error execution-search-error" role="alert">{error}</p>}
+      <section className="execution-results">
+        <header><div><h3>{loading ? 'Loading executions…' : `${result.total} matching run${result.total === 1 ? '' : 's'}`}</h3><small>Showing {result.total ? (page - 1) * 50 + 1 : 0}–{Math.min(page * 50, result.total)} of {result.total}{result.total > 2000 ? ' · Narrow filters to export' : ''}</small></div><button className="secondary" onClick={exportRuns} disabled={exporting || loading || filters !== applied || result.total === 0 || result.total > 2000}>{exporting ? <LoaderCircle className="spin" /> : <Download />}{exporting ? 'Exporting…' : 'Export CSV ZIP'}</button></header>
+        {!loading && result.runs.length === 0 && <div className="execution-empty">No runs match these filters. Try a wider date range or different model.</div>}
+        {result.runs.map((run) => (
+          <details className="execution-result" key={run.runId}>
+            <summary><span><strong>{modelNames.get(run.familyId) || run.familyId}</strong><small>{run.runId}</small></span><span>{new Date(run.preparedAt).toLocaleString()}</span><span className={`status ${executionStatusClass(run.status)}`}>{run.status.replace('run_', '').toUpperCase()}</span><ChevronDown /></summary>
+            <div className="execution-result-detail">
+              <dl><div><dt>Revision</dt><dd>{run.modelRevision}</dd></div><div><dt>Disposition</dt><dd>{run.disposition || '—'}</dd></div><div><dt>Completed</dt><dd>{run.completedAt ? new Date(run.completedAt).toLocaleString() : '—'}</dd></div><div><dt>Request ID</dt><dd>{run.requestId || '—'}</dd></div></dl>
+              {run.failureCode && <p className="execution-failure"><strong>{run.failureCode}</strong> {run.failureMessage}</p>}
+              <div className="execution-detail-grid">
+                <section><h4>Context</h4><pre>{JSON.stringify(run.context || {}, null, 2)}</pre></section>
+                <section><h4>Parameters</h4><pre>{JSON.stringify(run.parameters || {}, null, 2)}</pre></section>
+                <section><h4>Outputs</h4><pre>{JSON.stringify(run.outputs || [], null, 2)}</pre></section>
+                <section><h4>Feedback</h4><pre>{JSON.stringify(run.feedback || {}, null, 2)}</pre></section>
+                {run.dataSamples && <section><h4>Data samples</h4><pre>{JSON.stringify(run.dataSamples, null, 2)}</pre></section>}
+              </div>
+            </div>
+          </details>
+        ))}
+        {totalPages > 1 && <nav className="model-pagination" aria-label="Execution pages"><span>Page {page} of {totalPages}</span><div><button className="secondary" disabled={page === 1 || loading} onClick={() => setPage(page - 1)}><ChevronLeft /> Previous</button><button className="secondary" disabled={page === totalPages || loading} onClick={() => setPage(page + 1)}>Next <ChevronRight /></button></div></nav>}
+      </section>
+    </section>
   );
 }
 
@@ -1134,7 +1338,7 @@ function ModelImportDialog({
   initialFolderId,
 }: {
   onClose: () => void;
-  onImported: (model: Model) => Promise<void>;
+  onImported: (model: SavedDraft) => Promise<void>;
   folders: ModelFolder[];
   initialFolderId: string;
 }) {
@@ -1170,7 +1374,7 @@ function ModelImportDialog({
     }
     setBusy(true);
     try {
-      const created = await api<Model>(`/api/models/import?folderId=${encodeURIComponent(folderId)}`, {
+      const created = await api<SavedDraft>(`/api/models/import?folderId=${encodeURIComponent(folderId)}`, {
         method: 'POST',
         body: JSON.stringify(parsed),
       });
@@ -2292,14 +2496,15 @@ function NumericHistoryChart({
   }).join(' ');
   const limitY = (value: number) => 215 - ((value - min) / range) * 175;
   const tone = (point: ChartPoint) => {
-    const failed = /failed|cancelled/i.test(point.status || '');
+    if (point.status === 'run_cancelled') return 'cancelled';
+    if (point.status === 'prepared') return 'prepared';
+    if (point.status === 'run_failed') return 'rejected';
     const outside =
       (point.lsl !== undefined && point.value < point.lsl) ||
       (point.usl !== undefined && point.value > point.usl) ||
       point.disposition === 'run_rejected';
     if (outside) return 'rejected';
     if (point.boundLimited || point.limitAction) return 'warning';
-    if (failed || point.status === 'prepared') return 'inactive';
     return 'normal';
   };
   const average = values.reduce((total, value) => total + value, 0) / values.length;
@@ -2555,32 +2760,59 @@ function InputRegistry({
 
 function UserManagement() {
   const [users, setUsers] = useState<RegisteredUser[]>([]);
+  const [searchText, setSearchText] = useState('');
+  const [roleFilter, setRoleFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [filters, setFilters] = useState({ query: '', role: '', status: '' });
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<RegisteredUser>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
-  const loadUsers = async () => {
+  useEffect(() => {
+    let active = true;
     setLoading(true);
     setError('');
-    try {
-      setUsers(await api<RegisteredUser[]>('/api/users'));
-    } catch (reason) {
-      setError((reason as Error).message);
-    } finally {
+    const params = new URLSearchParams({
+      query: filters.query,
+      role: filters.role,
+      status: filters.status,
+      page: String(page),
+      pageSize: '25',
+    });
+    api<UserSearchResult>(`/api/users/search?${params}`).then((result) => {
+      if (!active) return;
+      if (page > 1 && result.items.length === 0) {
+        setPage(Math.max(1, Math.ceil(result.total / 25)));
+        return;
+      }
+      setUsers(result.items);
+      setTotal(result.total);
       setLoading(false);
-    }
+    }).catch((reason) => {
+      if (!active) return;
+      setError((reason as Error).message);
+      setLoading(false);
+    });
+    return () => { active = false; };
+  }, [filters, page, refreshVersion]);
+
+  const refreshUsers = () => setRefreshVersion((version) => version + 1);
+  const applyFilters = (event: FormEvent) => {
+    event.preventDefault();
+    setPage(1);
+    setFilters({ query: searchText.trim(), role: roleFilter, status: statusFilter });
   };
-  useEffect(() => {
-    loadUsers();
-  }, []);
 
   const removeUser = async (registered: RegisteredUser) => {
     if (!window.confirm(`Remove ${registered.employeeId} (${registered.username}) from R2R? Their corporate employee record will not be deleted.`)) return;
     setError('');
     try {
       await api(`/api/users/${encodeURIComponent(registered.employeeId)}`, { method: 'DELETE' });
-      await loadUsers();
+      refreshUsers();
     } catch (reason) {
       setError((reason as Error).message);
     }
@@ -2595,7 +2827,7 @@ function UserManagement() {
         method: 'PUT',
         body: JSON.stringify({ role: registered.role, status }),
       });
-      await loadUsers();
+      refreshUsers();
     } catch (reason) {
       setError((reason as Error).message);
     }
@@ -2614,6 +2846,39 @@ function UserManagement() {
         }
       />
       {error && <p className="user-management-error">{error}</p>}
+      <form className="user-registry-filters" onSubmit={applyFilters}>
+        <label>
+          Search employees
+          <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Name, ID, login, or email" maxLength={200} />
+        </label>
+        <label>
+          Role
+          <select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)}>
+            <option value="">All roles</option>
+            <option value="viewer">Viewer</option>
+            <option value="engineer">Engineer</option>
+            <option value="engineering_manager">Engineering manager</option>
+            <option value="admin">Administrator</option>
+          </select>
+          <ChevronDown aria-hidden="true" />
+        </label>
+        <label>
+          Status
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+            <option value="locked">Locked</option>
+          </select>
+          <ChevronDown aria-hidden="true" />
+        </label>
+        <button className="secondary" type="submit"><Search /> Search</button>
+        <button className="secondary" type="button" onClick={() => {
+          setSearchText(''); setRoleFilter(''); setStatusFilter(''); setPage(1);
+          setFilters({ query: '', role: '', status: '' });
+          refreshUsers();
+        }}>Clear</button>
+      </form>
       <div className="panel input-registry-panel">
         <div className="input-registry-table user-registry-table">
           <div className="input-registry-head user-registry-grid">
@@ -2635,7 +2900,7 @@ function UserManagement() {
                 <span>{registered.email || '—'}</span>
                 <span>{registered.role.replaceAll('_', ' ')}</span>
                 <span>
-                  <span className={`status ${registered.status === 'disabled' ? 'superseded' : 'approved'}`}>
+                  <span className={`status ${registered.status === 'active' || !registered.status ? 'approved' : 'superseded'}`}>
                     {(registered.status || 'active').toUpperCase()}
                   </span>
                 </span>
@@ -2648,11 +2913,11 @@ function UserManagement() {
                     onClick={() =>
                       setUserStatus(
                         registered,
-                        registered.status === 'disabled' ? 'active' : 'disabled',
+                        registered.status === 'active' || !registered.status ? 'disabled' : 'active',
                       )
                     }
                   >
-                    {registered.status === 'disabled' ? 'Enable' : 'Disable'}
+                    {registered.status === 'active' || !registered.status ? 'Disable' : 'Enable'}
                   </button>
                   <button className="danger" onClick={() => removeUser(registered)}>
                     <Trash2 /> Remove
@@ -2662,16 +2927,27 @@ function UserManagement() {
             ))}
           {loading && <div className="user-registry-message">Loading registered users…</div>}
           {!loading && !users.length && (
-            <div className="user-registry-message">No employees are registered.</div>
+            <div className="user-registry-message">{filters.query || filters.role || filters.status ? 'No employees match these filters.' : 'No employees are registered.'}</div>
           )}
         </div>
       </div>
+      {!loading && total > 0 && (
+        <div className="model-pagination">
+          <span>Showing {Math.min((page - 1) * 25 + 1, total)}–{Math.min(page * 25, total)} of {total} employees</span>
+          <div>
+            <button className="secondary" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button>
+            <strong>Page {page} of {Math.ceil(total / 25)}</strong>
+            <button className="secondary" disabled={page * 25 >= total} onClick={() => setPage(page + 1)}>Next</button>
+          </div>
+        </div>
+      )}
       {adding && (
         <AddUserDialog
           onClose={() => setAdding(false)}
           onSaved={async () => {
             setAdding(false);
-            await loadUsers();
+            setPage(1);
+            refreshUsers();
           }}
         />
       )}
@@ -2681,7 +2957,7 @@ function UserManagement() {
           onClose={() => setEditing(undefined)}
           onSaved={async () => {
             setEditing(undefined);
-            await loadUsers();
+            refreshUsers();
           }}
         />
       )}
@@ -3618,6 +3894,7 @@ function ModelDrawer({
   registeredUsers,
   role,
   currentEmployeeId,
+  onViewExecutions,
   onClose,
   onChanged,
 }: {
@@ -3628,8 +3905,9 @@ function ModelDrawer({
   registeredUsers: ConfigUser[];
   role: User['role'];
   currentEmployeeId: string;
+  onViewExecutions: () => void;
   onClose: () => void;
-  onChanged: () => Promise<void>;
+  onChanged: (issues?: string[]) => Promise<void>;
 }) {
   const isNew = !model.id;
   const [history, setHistory] = useState<Model[]>([]);
@@ -3652,13 +3930,14 @@ function ModelDrawer({
   const [actionError, setActionError] = useState('');
   const [form, setForm] = useState(() => modelEditorForm(model, sources, inputDefinitions));
   const currentModel = history.find((item) => item.id === model.id) || model;
-  const currentModelStatus = currentModel.status;
   const canDevelop = role === 'engineer' || role === 'engineering_manager' || role === 'admin';
   const canApprove = role === 'engineering_manager' || role === 'admin';
   const activeRevision = history.find((item) => item.status === 'approved' && item.enabled) ||
     (model.status === 'approved' && model.enabled ? model : undefined);
-  const manageableDraft = history.find((item) => item.status === 'draft') ||
-    (model.status === 'draft' ? model : undefined);
+  const openRevision = history.find((item) => item.status === 'pending_approval') ||
+    history.find((item) => item.status === 'draft') ||
+    (model.status === 'draft' || model.status === 'pending_approval' ? model : undefined);
+  const manageableDraft = openRevision?.status === 'draft' ? openRevision : undefined;
   const canMoveModel = role === 'admin' || currentModel.owner === currentEmployeeId;
   useEffect(() => {
     if (!showManageMenu) return;
@@ -3779,7 +4058,9 @@ function ModelDrawer({
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '') || 'model';
-    const blob = new Blob([`${JSON.stringify(revision, null, 2)}\n`], {
+    const definition = { ...revision };
+    delete definition.validationIssues;
+    const blob = new Blob([`${JSON.stringify(definition, null, 2)}\n`], {
       type: 'application/json;charset=utf-8',
     });
     const downloadURL = URL.createObjectURL(blob);
@@ -3814,6 +4095,7 @@ function ModelDrawer({
       );
       const payload = {
         ...editTarget,
+        validationIssues: undefined,
         id: '',
         folderId: isNew ? folderId : editTarget.folderId,
         name: form.name,
@@ -3836,7 +4118,7 @@ function ModelDrawer({
         createdBy: '',
       };
       const editingDraft = !isNew && editTarget.status === 'draft';
-      await api(
+      const saved = await api<SavedDraft>(
         isNew
           ? '/api/models'
           : editingDraft
@@ -3847,7 +4129,7 @@ function ModelDrawer({
           body: JSON.stringify(payload),
         },
       );
-      await onChanged();
+      await onChanged(saved.validationIssues);
       await refreshHistory();
     } catch (e) {
       setError((e as Error).message);
@@ -3896,6 +4178,19 @@ function ModelDrawer({
       await refreshHistory();
     } catch (e) {
       setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const withdrawSubmission = async (id: string) => {
+    if (!window.confirm('Withdraw this submission? The revision will return to an editable draft.')) return;
+    setBusy(true);
+    setActionError('');
+    try {
+      await api(`/api/models/${id}/withdraw`, { method: 'POST' });
+      await onChanged();
+    } catch (reason) {
+      setActionError((reason as Error).message);
     } finally {
       setBusy(false);
     }
@@ -4062,17 +4357,20 @@ function ModelDrawer({
         {!editing ? (
           <>
             <div className="drawer-actions">
-              {canDevelop && currentModelStatus !== 'pending_approval' && (
+              {canDevelop && (
                 <button
                   className="primary model-action"
+                  disabled={busy || openRevision?.status === 'pending_approval'}
+                  title={openRevision?.status === 'pending_approval' ? 'Resolve the pending approval before creating another revision' : undefined}
                   onClick={() => {
-                    setEditTarget(currentModel);
-                    setForm(modelEditorForm(currentModel, sources, inputDefinitions));
+                    const target = manageableDraft || currentModel;
+                    setEditTarget(target);
+                    setForm(modelEditorForm(target, sources, inputDefinitions));
                     setEditing(true);
                   }}
                 >
                   <Plus />
-                  {currentModelStatus === 'draft' ? 'Edit draft' : 'Create revision'}
+                  {openRevision?.status === 'pending_approval' ? 'Approval pending' : manageableDraft ? 'Edit draft' : 'Create revision'}
                 </button>
               )}
               {canMoveModel && (
@@ -4102,27 +4400,32 @@ function ModelDrawer({
               )}
             </div>
             <div className="model-detail-tools">
-              <button className="secondary" onClick={() => setShowDependencies(true)}>
-                <GitBranch />
-                View dependencies
-              </button>
-              <button className="secondary" onClick={() => setShowPayload(true)}>
-                <Code2 />
-                View API payload
-              </button>
+              <div className="model-detail-group">
+                <span>RUN HISTORY</span>
+                <div className="model-detail-buttons">
+                  <button className="secondary" onClick={onViewExecutions}><List /> View executions</button>
+                  {model.status === 'approved' && (
+                    <button
+                      className="secondary chart-open-button"
+                      disabled={!historyChartSeries.length}
+                      onClick={() => setShowHistoryChart(true)}
+                    >
+                      <LineChart />
+                      View run trend chart
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="model-detail-group">
+                <span>MODEL TOOLS</span>
+                <div className="model-detail-buttons">
+                  <button className="secondary" onClick={() => setShowDependencies(true)}><GitBranch /> View dependencies</button>
+                  <button className="secondary" onClick={() => setShowPayload(true)}><Code2 /> View API payload</button>
+                </div>
+              </div>
             </div>
             <section className="contract">
               <h3>{activeRevision ? 'Active model contract' : 'Model contract'}</h3>
-              {model.status === 'approved' && (
-                <button
-                  className="secondary chart-open-button"
-                  disabled={!historyChartSeries.length}
-                  onClick={() => setShowHistoryChart(true)}
-                >
-                  <Activity />
-                  View run trend chart
-                </button>
-              )}
               {model.dataSamples?.length > 0 && (
                 <>
                   <h4>Data samples</h4>
@@ -4186,6 +4489,11 @@ function ModelDrawer({
                           {effectiveModelStatus(item).label}
                         </span>
                       )}
+                      {item.status === 'draft' && (
+                        <span className={`status draft-readiness ${item.validationIssues?.length ? 'needs-fixes' : 'ready'}`}>
+                          {item.validationIssues?.length ? 'NEEDS FIXES' : 'READY TO SUBMIT'}
+                        </span>
+                      )}
                     </div>
                     <p>{item.changeNote}</p>
                     <small>
@@ -4202,6 +4510,11 @@ function ModelDrawer({
                         Rejected by {item.rejectedBy}: {item.rejectionReason}
                       </p>
                     )}
+                    {item.status === 'draft' && !!item.validationIssues?.length && (
+                      <p className="revision-validation-message" role="status">
+                        Submission blocked: {item.validationIssues[0]}
+                      </p>
+                    )}
                     <div className="revision-actions">
                       <button
                         type="button"
@@ -4212,9 +4525,8 @@ function ModelDrawer({
                         <Download />
                         Download JSON
                       </button>
-                      {item.status === 'draft' && (
+                      {item.status === 'draft' && canDevelop && (
                         <>
-                        {canDevelop && (
                           <button
                             className="secondary model-action"
                             disabled={busy}
@@ -4224,90 +4536,76 @@ function ModelDrawer({
                               setEditing(true);
                             }}
                           >
-                            <Settings2 />
-                            Edit draft
+                            <Settings2 /> Edit draft
                           </button>
-                        )}
-                        {canDevelop && (
                           <button
                             className="secondary model-action"
                             disabled={busy}
                             onClick={() => setSimulationDraft(item)}
                           >
-                            <FlaskConical />
-                            Simulate draft
+                            <FlaskConical /> Simulate draft
                           </button>
-                        )}
-                        {canDevelop && (
                           <button
                             className="secondary model-action"
-                            disabled={busy}
+                            disabled={busy || !!item.validationIssues?.length}
                             onClick={() => submitForApproval(item.id)}
                           >
-                            <Upload />
-                            Submit approval
+                            <Upload /> Submit approval
                           </button>
-                        )}
-                        {canDevelop && (
                           <button
                             className="danger model-action"
                             disabled={busy}
                             onClick={() => deleteRevision(item.id)}
                           >
-                            <Trash2 />
-                            Delete draft
+                            <Trash2 /> Delete draft
                           </button>
-                        )}
                         </>
                       )}
                       {item.status === 'pending_approval' && canApprove && (
                         <>
-                        <button
-                          className="secondary model-action"
-                          disabled={busy || reviewLoadingId === item.id}
-                          onClick={() => void openRevisionReview(item)}
-                        >
-                          <GitBranch />
-                          {reviewLoadingId === item.id ? 'Loading…' : 'Review changes'}
-                        </button>
-                        <button
-                          className="secondary model-action"
-                          disabled={busy}
-                          onClick={() => setSimulationDraft(item)}
-                        >
-                          <FlaskConical />
-                          Simulate revision
-                        </button>
-                        <button
-                          className="approve model-action"
-                          disabled={busy}
-                          onClick={() => approve(item.id)}
-                        >
-                          <ShieldCheck />
-                          Approve revision
-                        </button>
-                        <button
-                          className="danger model-action"
-                          disabled={busy}
-                          onClick={() => reject(item.id)}
-                        >
-                          <X />
-                          Reject revision
-                        </button>
+                          <button
+                            className="secondary model-action"
+                            disabled={busy || reviewLoadingId === item.id}
+                            onClick={() => void openRevisionReview(item)}
+                          >
+                            <GitBranch /> {reviewLoadingId === item.id ? 'Loading…' : 'Review changes'}
+                          </button>
+                          <button
+                            className="secondary model-action"
+                            disabled={busy}
+                            onClick={() => setSimulationDraft(item)}
+                          >
+                            <FlaskConical /> Simulate revision
+                          </button>
+                          <button className="approve model-action" disabled={busy} onClick={() => approve(item.id)}>
+                            <ShieldCheck /> Approve revision
+                          </button>
+                          <button className="danger model-action" disabled={busy} onClick={() => reject(item.id)}>
+                            <X /> Reject revision
+                          </button>
                         </>
+                      )}
+                      {item.status === 'pending_approval' && (role === 'admin' || item.submittedBy === currentEmployeeId) && (
+                        <button
+                          className="secondary model-action"
+                          disabled={busy}
+                          onClick={() => void withdrawSubmission(item.id)}
+                        >
+                          <ChevronLeft /> Withdraw request
+                        </button>
                       )}
                       {item.status === 'superseded' && canDevelop && (
                         <button
                           className="secondary model-action"
-                          disabled={busy}
+                          disabled={busy || !!openRevision}
+                          title={openRevision ? `Resolve open revision ${openRevision.revision} before creating another` : undefined}
                           onClick={() => {
                             setEditTarget(item);
                             setForm(modelEditorForm(item, sources, inputDefinitions));
                             setEditing(true);
                           }}
                         >
-                          <GitBranch />
-                          Create from this
+                          <GitBranch /> Create from this
                         </button>
                       )}
                     </div>

@@ -444,13 +444,54 @@ function SQLQueryTester({
   );
 }
 
-function highlightExpression(expression: string) {
+function expressionBrackets(expression: string, caret: number | null) {
+  const stack: number[] = [];
+  const pairs = new Map<number, number>();
+  const unmatched = new Set<number>();
+  let inString = false;
+  for (let index = 0; index < expression.length; index++) {
+    const character = expression[index];
+    if (inString) {
+      if (character === '\\') index++;
+      else if (character === '"') inString = false;
+    } else if (character === '"') {
+      inString = true;
+    } else if (character === '(') {
+      stack.push(index);
+    } else if (character === ')') {
+      const opening = stack.pop();
+      if (opening === undefined) unmatched.add(index);
+      else {
+        pairs.set(opening, index);
+        pairs.set(index, opening);
+      }
+    }
+  }
+  stack.forEach((index) => unmatched.add(index));
+  const adjacent = caret === null ? undefined : [caret - 1, caret].find(
+    (index) => expression[index] === '(' || expression[index] === ')',
+  );
+  const active = new Set<number>();
+  if (adjacent !== undefined) {
+    active.add(adjacent);
+    const matching = pairs.get(adjacent);
+    if (matching !== undefined) active.add(matching);
+  }
+  return { active, unmatched };
+}
+
+function highlightExpression(expression: string, caret: number | null = null) {
   const pattern = /"(?:\\.|[^"\\])*"|@[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?|\b(?:AND|OR|true|false)\b|>=|<=|==|!=|[+*/<>-]|\b\d+(?:\.\d+)?\b|[A-Za-z_][A-Za-z0-9_]*|\s+|./gi;
   const tokens = expression.match(pattern) || [];
+  const brackets = expressionBrackets(expression, caret);
   let offset = 0;
   return tokens.map((token, index) => {
     const start = offset;
     offset += token.length;
+    if (token === '(' || token === ')') {
+      const state = brackets.active.has(start) ? 'matched' : brackets.unmatched.has(start) ? 'unmatched' : '';
+      return <span className={`expression-token bracket ${state}`} key={index}>{token}</span>;
+    }
     if (/^"/.test(token)) return <span className="expression-token string" key={index}>{token}</span>;
     if (/^@/.test(token)) {
       const dot = token.indexOf('.');
@@ -491,6 +532,7 @@ function ExpressionAutocomplete({
 }) {
   const inputRef = useRef<any>(null);
   const highlightRef = useRef<HTMLPreElement>(null);
+  const [caretPosition, setCaretPosition] = useState<number | null>(null);
   const [matches, setMatches] = useState<
     { name: string; source: string; plain?: boolean; kind?: 'value' | 'sample' | 'sample-column' }[]
   >([]);
@@ -563,6 +605,7 @@ function ExpressionAutocomplete({
     requestAnimationFrame(() => {
       input.focus();
       input.setSelectionRange(nextCaret, nextCaret);
+      setCaretPosition(nextCaret);
     });
   };
   const editorProps: any = {
@@ -573,7 +616,12 @@ function ExpressionAutocomplete({
     onChange: (event: any) => {
       onChange(event.target.value);
       const caret = event.target.selectionStart ?? event.target.value.length;
+      setCaretPosition(caret);
       updateMatches(event.target.value, caret);
+    },
+    onSelect: (event: any) => {
+      const input = event.currentTarget;
+      setCaretPosition(input.selectionStart === input.selectionEnd ? input.selectionStart : null);
     },
     onClick: (event: any) => {
       const caret = event.currentTarget.selectionStart ?? 0;
@@ -597,13 +645,16 @@ function ExpressionAutocomplete({
         insert(matches[activeIndex]);
       } else if (event.key === 'Escape') setMatches([]);
     },
-    onBlur: () => window.setTimeout(() => setMatches([]), 120),
+    onBlur: () => {
+      setCaretPosition(null);
+      window.setTimeout(() => setMatches([]), 120);
+    },
   };
   return (
     <div className={`sql-autocomplete logic-autocomplete ${multiline ? 'multiline' : ''}`}>
       {multiline && (
         <pre className="expression-highlight" aria-hidden="true" ref={highlightRef}>
-          {highlightExpression(value)}
+          {highlightExpression(value, caretPosition)}
           {'\n'}
         </pre>
       )}
